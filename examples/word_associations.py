@@ -19,8 +19,6 @@ Set GLOVE_PATH to use real embeddings.
 """
 
 import numpy as np
-import sys
-sys.path.insert(0, "..")
 
 from transversal_memory.embeddings import (
     WordMemory, random_embeddings, load_glove

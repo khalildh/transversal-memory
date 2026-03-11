@@ -13,8 +13,6 @@ Demonstrates:
 """
 
 import numpy as np
-import sys
-sys.path.insert(0, "..")
 
 from transversal_memory import P3Memory, GramMemory, project_to_line, random_projection
 from transversal_memory.embeddings import WordMemory, random_embeddings, load_glove

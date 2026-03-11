@@ -14,8 +14,6 @@ Demonstrates concretely:
 """
 
 import numpy as np
-import sys
-sys.path.insert(0, "..")
 
 from transversal_memory import (
     CooccurrenceMatrix, embeddings_from_associations,

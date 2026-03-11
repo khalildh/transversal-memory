@@ -8,8 +8,6 @@ No embeddings, no ML. Pure projective geometry.
 """
 
 import numpy as np
-import sys
-sys.path.insert(0, "..")
 
 from transversal_memory import (
     random_line, P3Memory, find_transversals,

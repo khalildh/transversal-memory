@@ -79,31 +79,49 @@ class CooccurrenceMatrix:
                 w = 1.0 / (1.0 + i) if position_decay else 1.0
                 self.add(source, target, w)
 
-    def build(self, weighting: str = "ppmi") -> np.ndarray:
+    def build(self, weighting: str = "ppmi", sparse: bool = False):
         """
-        Build the full (n_words × n_words) co-occurrence matrix.
+        Build the (n_words × n_words) co-occurrence matrix.
 
         weighting: "count", "log", "pmi", "ppmi"
+        sparse:    if True, build as scipy.sparse.csr_matrix (for large vocabs)
         Returns the matrix (also stored as self.C).
         """
         self.vocab = sorted(self._word_set)
         self.word2idx = {w: i for i, w in enumerate(self.vocab)}
         n = len(self.vocab)
 
-        C = np.zeros((n, n))
-        for (src, tgt), count in self._counts.items():
-            i = self.word2idx[src]
-            j = self.word2idx[tgt]
-            C[i, j] = count
+        if sparse or n > 5000:
+            from scipy.sparse import csr_matrix
+            rows, cols, vals = [], [], []
+            for (src, tgt), count in self._counts.items():
+                rows.append(self.word2idx[src])
+                cols.append(self.word2idx[tgt])
+                vals.append(count)
+            C_raw = csr_matrix((vals, (rows, cols)), shape=(n, n))
 
-        if weighting == "count":
-            pass
-        elif weighting == "log":
-            C = np.log1p(C)
-        elif weighting in ("pmi", "ppmi"):
-            C = _apply_pmi(C, positive=(weighting == "ppmi"))
+            if weighting in ("pmi", "ppmi"):
+                C = _apply_pmi_sparse(C_raw, positive=(weighting == "ppmi"))
+            elif weighting == "log":
+                C_raw.data = np.log1p(C_raw.data)
+                C = C_raw
+            else:
+                C = C_raw
         else:
-            raise ValueError(f"Unknown weighting: {weighting!r}")
+            C = np.zeros((n, n))
+            for (src, tgt), count in self._counts.items():
+                i = self.word2idx[src]
+                j = self.word2idx[tgt]
+                C[i, j] = count
+
+            if weighting == "count":
+                pass
+            elif weighting == "log":
+                C = np.log1p(C)
+            elif weighting in ("pmi", "ppmi"):
+                C = _apply_pmi(C, positive=(weighting == "ppmi"))
+            else:
+                raise ValueError(f"Unknown weighting: {weighting!r}")
 
         self.C = C
         return C
@@ -125,9 +143,23 @@ class CooccurrenceMatrix:
         """
         assert hasattr(self, "C"), "Call build() first"
         dim = min(dim, min(self.C.shape) - 1)
-        U, s, Vt = np.linalg.svd(self.C, full_matrices=False)
+
+        # Use scipy sparse truncated SVD for large matrices
+        from scipy.sparse import issparse, csr_matrix
+        from scipy.sparse.linalg import svds
+
+        C = self.C
+        if not issparse(C):
+            C = csr_matrix(C)
+        U, s, Vt = svds(C, k=dim)
+        # svds returns smallest singular values first — reverse
+        idx = np.argsort(s)[::-1]
+        s = s[idx]
+        U = U[:, idx]
+        Vt = Vt[idx, :]
+
         # Absorb sqrt(Σ) into both sides (standard for PMI-SVD)
-        sq = np.sqrt(s[:dim])
+        sq = np.sqrt(s)
         U_emb = U[:, :dim] * sq[np.newaxis, :]   # (n_words, dim)
         V_emb = Vt[:dim, :].T * sq[np.newaxis, :]  # (n_words, dim)
 
@@ -271,6 +303,39 @@ def _apply_pmi(C: np.ndarray, positive: bool = True) -> np.ndarray:
         pmi = np.maximum(pmi, 0.0)
 
     return pmi
+
+
+def _apply_pmi_sparse(C, positive: bool = True):
+    """
+    Sparse PPMI: operates on scipy.sparse matrix without densifying.
+    """
+    from scipy.sparse import csr_matrix
+
+    total = C.sum()
+    if total < 1e-12:
+        return C
+
+    row_sums = np.array(C.sum(axis=1)).flatten()
+    col_sums = np.array(C.sum(axis=0)).flatten()
+
+    row_sums = np.where(row_sums < 1e-12, 1.0, row_sums)
+    col_sums = np.where(col_sums < 1e-12, 1.0, col_sums)
+
+    C_coo = C.tocoo()
+    pmi_data = np.log(
+        C_coo.data * total / (row_sums[C_coo.row] * col_sums[C_coo.col])
+    )
+
+    if positive:
+        pmi_data = np.maximum(pmi_data, 0.0)
+
+    # Drop zeros to keep it sparse
+    mask = pmi_data > 0
+    result = csr_matrix(
+        (pmi_data[mask], (C_coo.row[mask], C_coo.col[mask])),
+        shape=C.shape,
+    )
+    return result
 
 
 # ── Convenience: build everything from an associations dict ───────────────────

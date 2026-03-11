@@ -33,6 +33,133 @@ with the quadratic formula. No grid search, no gradient descent.
 
 ---
 
+## Results on the full Overmann dataset
+
+Using the [Overmann WordAssociations](https://github.com/PeterOvermann/WordAssociations)
+dataset (64,823 source words, 1.88M associations), the system builds its own
+embeddings from the association norms via PPMI + sparse truncated SVD — no
+external corpus or pre-trained embeddings required.
+
+### Discriminative scoring (GramMemory)
+
+Train on 75% of each word's associates, test on the held-out 25%.
+
+**Batch evaluation (500 words):** held-out associates score higher than
+random non-associates **94.6%** of the time (baseline = 50%).
+
+Per-word examples:
+
+| Source | Train | Held-out | Held-out mean | Non-assoc mean | Separated |
+|--------|------:|---------:|--------------:|---------------:|-----------|
+| dog    |    34 |       12 |        0.3321 |         0.2874 | ✓         |
+| music  |    65 |       22 |        0.3604 |         0.3039 | ✓         |
+| ocean  |    48 |       16 |        0.3628 |         0.2769 | ✓         |
+| king   |    32 |       11 |        0.3946 |         0.3333 | ✓         |
+| brain  |    30 |       10 |        0.3956 |         0.3049 | ✓         |
+
+### Principal relational axes
+
+The eigenvectors of the Gram matrix reveal semantically coherent axes:
+
+```
+king:
+  axis 1: chivalry, reign, authority, succession, monarch, ruler
+  axis 2: queen, realm, regal, empire, throne, kingdom
+  axis 3: heir, noble, ceremony, court, coronation, sovereign
+
+brain:
+  axis 1: perception, cognition, consciousness, neuroplasticity, cells, thought
+  axis 2: think, region, structure, health, tumor, disorder
+  axis 3: amygdala, hippocampus, waves, imaging, mind, brainstem
+
+fire:
+  axis 1: char, engine, blaze, fighter, wildfire, spark
+  axis 2: escape, flame, alarm, hazard, burn, torch
+  axis 3: smoke, ember, department, burn, safety, extinguisher
+```
+
+### Cross-word relational similarity
+
+Cosine similarity between Gram matrices measures how similar two words'
+*relational patterns* are (not lexical similarity):
+
+```
+Animals:       dog    cat  horse   bird
+  dog        1.000  0.860  0.537  0.663
+  cat        0.860  1.000  0.582  0.673
+  horse      0.537  0.582  1.000  0.430
+  bird       0.663  0.673  0.430  1.000
+
+Emotions:    anger   fear sadness    joy
+  anger      1.000  0.901   0.800  0.613
+  fear       0.901  1.000   0.904  0.571
+  sadness    0.800  0.904   1.000  0.451
+  joy        0.613  0.571   0.451  1.000
+```
+
+Dog/cat are most similar (0.86); joy is the outlier among emotions (0.45–0.61).
+
+### Nearest neighbours (SVD embeddings)
+
+The PPMI + SVD embeddings themselves are semantically coherent:
+
+```
+dog:
+  source (cue):   pooch(0.96), dogs(0.95), doggy(0.94), mutt(0.94), beagle(0.92)
+  target (assoc): puppy(0.93), cat(0.91), hound(0.90), breed(0.90)
+
+king:
+  source (cue):   empress(0.99), throne(0.99), kings(0.99), monarch(0.99)
+  target (assoc): queen(0.98), prince(0.97)
+```
+
+### Generative retrieval (P3Memory)
+
+The generative mode produces geometrically valid transversals (Plücker
+residuals ~1e-16), but decoding to vocabulary words does not yet work
+well at this scale — the random 4×32 projection to P³ compresses too much
+information for 67K words. This mode works well on smaller vocabularies
+(see `examples/cooccurrence_demo.py` where it correctly retrieves known
+associates from ~130 words). Improving the projection strategy for large
+vocabularies is an open problem.
+
+---
+
+## How the pipeline works
+
+```
+Association Norms          PPMI Matrix              SVD Embeddings
+┌──────────────────┐    ┌───────────────────┐    ┌──────────────────┐
+│ dog →             │    │         puppy cat │    │                  │
+│   [puppy, bark,   │───▶│ dog   [0.82 0.41]│───▶│  C ≈ U · √Σ · Vᵀ│
+│    fetch, ...]    │    │ cat   [0.31 0.96]│    │                  │
+│ cat →             │    │                   │    │  U = source vecs │
+│   [kitten, ...]   │    │ filters generics  │    │  V = target vecs │
+└──────────────────┘    └───────────────────┘    └──────────────────┘
+
+   Plücker Embedding                    Two Retrieval Modes
+┌──────────────────────┐    ┌─────────────────┬──────────────────────┐
+│ For "dog → puppy":   │    │ GramMemory      │ P3Memory             │
+│                      │    │                 │                      │
+│ a = U[dog]    ∈ R³²  │    │ M = Σ pᵢ⊗pᵢ    │ Store 3 + query 1    │
+│ b = V[puppy]  ∈ R³²  │───▶│ score = cᵀMc   │ → 2 transversals     │
+│                      │    │                 │                      │
+│ p = Wa ∧ Wb ∈ R⁶    │    │ 94.6% held-out  │ exact algebra,       │
+│ (Plücker 6-vector)   │    │ separation      │ no optimisation      │
+└──────────────────────┘    └─────────────────┴──────────────────────┘
+```
+
+Key design choices:
+- **PPMI** (positive pointwise mutual information) suppresses high-frequency
+  generic associates that co-occur with everything
+- **Separate U/V vectors** from SVD preserve the directionality of associations
+  (U = cue role, V = associate role)
+- **Sparse matrix + truncated SVD** (scipy) handles 67K×67K vocabulary
+  in seconds with minimal memory
+- **Pickle checkpointing** caches the embeddings so subsequent runs are instant
+
+---
+
 ## Mathematical background
 
 A line in P³ is represented by its Plücker coordinates: a 6-vector
@@ -40,13 +167,24 @@ p = (p₀₁, p₀₂, p₀₃, p₁₂, p₁₃, p₂₃) where p_ij = a_i·b_j
 for two points a, b on the line. This is the exterior product a∧b.
 
 Two lines meet iff their Plücker inner product vanishes:
-  <p, q> = p₀₁q₂₃ - p₀₂q₁₃ + p₀₃q₁₂ + p₁₂q₀₃ - p₁₃q₀₂ + p₂₃q₀₁ = 0
+  ⟨p, q⟩ = p₀₁q₂₃ - p₀₂q₁₃ + p₀₃q₁₂ + p₁₂q₀₃ - p₁₃q₀₂ + p₂₃q₀₁ = 0
 
 A valid line satisfies the Plücker relation: p₀₁p₂₃ - p₀₂p₁₃ + p₀₃p₁₂ = 0
 
 The space of all lines in P³ is the Grassmannian G(2,4), embedded in P⁵
 via the Plücker map. Schubert calculus on G(2,4) gives the classic result:
 4 lines in general position → exactly 2 transversals.
+
+### Key equations
+
+| Equation | Description |
+|----------|-------------|
+| p = a ∧ b | Plücker embedding of line through points a, b |
+| p₀₁p₂₃ − p₀₂p₁₃ + p₀₃p₁₂ = 0 | Plücker relation (defines G(2,4) ⊂ P⁵) |
+| ⟨p, q⟩ = p · (★q) = 0 | Incidence: lines p, q meet (★ = Hodge dual) |
+| A = [★L₁; ★L₂; ★L₃; ★L₄] | Constraint matrix, null(A) = span{v₁, v₂} |
+| αt² + βt + γ = 0 | Plücker quadratic for T = t·v₁ + v₂ |
+| M = Σᵢ pᵢpᵢᵀ, score(c) = cᵀMc / tr(M) | Gram energy scoring |
 
 ### Dimensional hierarchy
 
@@ -95,32 +233,21 @@ score = mem.score(line(source, candidate))
 axes  = mem.principal_axes(k=3)   # dominant relational directions
 ```
 
----
+### Self-contained embeddings (no GloVe needed)
 
-## Word association example
+Build embeddings directly from association norms:
 
 ```python
-from transversal_memory import GramMemory, ProjectedMemory
-from transversal_memory.embeddings import load_glove, make_line
+from transversal_memory.cooccurrence import embeddings_from_associations
 
-glove = load_glove("glove.6B.50d.txt")
+associations = {
+    "dog": ["puppy", "bark", "fetch", "bone", ...],
+    "cat": ["kitten", "purr", "whiskers", ...],
+    ...
+}
 
-# Build discriminative memory for "abandonment"
-mem = GramMemory(n_proj=3)
-associates = ["child","fear","trauma","loss","loneliness","rejection",
-              "isolation","alienation","estrangement","betrayal"]
-for word in associates:
-    mem.store_line(make_line(glove, "abandonment", word))
-
-# Score a new candidate
-print(mem.score(make_line(glove, "abandonment", "grief")))    # should be high
-print(mem.score(make_line(glove, "abandonment", "algebra")))  # should be low
-
-# Find principal relational axes
-axes = mem.principal_axes(k=3)
-# axes[0] ≈ emotional-consequence direction
-# axes[1] ≈ synonym direction
-# axes[2] ≈ co-occurrence direction
+emb = embeddings_from_associations(associations, dim=32)
+line = emb.make_line("dog", "puppy")  # Plücker 6-vector
 ```
 
 ---
@@ -134,6 +261,21 @@ cd transversal-memory
 pip install -e .
 ```
 
+## Examples
+
+```bash
+# Pure geometry: 4 lines → 2 transversals (no embeddings)
+python examples/basic_geometry.py
+
+# Self-contained pipeline on small dataset (~130 words)
+python examples/cooccurrence_demo.py
+
+# Full Overmann dataset (65K words, auto-downloads)
+git clone https://github.com/PeterOvermann/WordAssociations data/WordAssociations
+python examples/full_dataset_demo.py
+# First run builds PPMI + SVD (~4s), subsequent runs load from cache
+```
+
 ---
 
 ## Files
@@ -141,16 +283,22 @@ pip install -e .
 ```
 transversal_memory/
 ├── transversal_memory/
-│   ├── plucker.py       # Plücker geometry: coords, inner product, validity
+│   ├── plucker.py       # Plücker geometry: coords, inner product, Hodge dual
 │   ├── solver.py        # Exact Plücker solver via PCA + quadratic formula
 │   ├── memory.py        # P3Memory, GramMemory, ProjectedMemory
-│   └── embeddings.py    # Word vector utilities
+│   ├── embeddings.py    # Word vector utilities (GloVe, random, make_line)
+│   └── cooccurrence.py  # PPMI + sparse SVD embedding pipeline
 ├── examples/
 │   ├── basic_geometry.py      # Pure geometry: 4 lines → 2 transversals
 │   ├── capital_cities.py      # Analogy: Paris:France :: Madrid:Spain
-│   └── word_associations.py   # Full word association scoring + generation
-└── tests/
-    └── test_plucker.py
+│   ├── word_associations.py   # Word association scoring + generation
+│   ├── cooccurrence_demo.py   # Full pipeline on small dataset
+│   └── full_dataset_demo.py   # Full Overmann dataset (65K words)
+├── tests/
+│   └── test_plucker.py
+└── data/                      # (created on first run)
+    ├── WordAssociations/      # Overmann dataset (git clone)
+    └── cache/                 # Pickled embeddings
 ```
 
 ---
@@ -160,12 +308,14 @@ transversal_memory/
 - Overmann, P. (2022). Triadic Memory — A Fundamental Algorithm for Cognitive Computing.
   https://peterovermann.com/TriadicMemory.pdf
 
+- Overmann, P. (2025). Word Associations Dataset.
+  https://github.com/PeterOvermann/WordAssociations
+
 - Kanerva, P. (1988). Sparse Distributed Memory. MIT Press.
 
 - Schubert, H. (1879). Calcül der abzählenden Geometrie.
 
-- "Attention Is Not What You Need: Grassmann Flows as an Attention-Free
-  Alternative for Sequence Modeling." arXiv:2512.19428 (2025).
+- Levy, O. & Goldberg, Y. (2014). Neural Word Embedding as Implicit Matrix Factorization. NIPS.
 
 ---
 
