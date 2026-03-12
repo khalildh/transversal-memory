@@ -132,6 +132,41 @@ Target word ranks 1–3 out of 67,378 candidates for 6/8 test queries.
 Decoding uses the Plücker inner product: `|⟨T, L⟩| → 0` means the
 candidate line L is incident with the transversal T.
 
+### Continuous generation (multi-transversal)
+
+A single transversal provides only 1 scalar constraint — not enough to
+discriminate 67K candidates (accidental near-zeros dominate). The fix:
+sample many different 4-tuples from a word's associates, compute a
+transversal from each, and rank candidates by their **combined** score
+across all transversals.
+
+With 20–30 transversals, the generated words are semantically coherent —
+**10.2x more similar** to the source concept than random baseline,
+averaged across 20 test words:
+
+| Concept  | Similarity ratio | Top generated words |
+|----------|:----------------:|---------------------|
+| tree     | 93x | bud, botany, stalks, inflorescence, leaves, bristlecone, thorns |
+| guitar   | 47x | musicians, violin, multitrack, albums, ensembles, flute, bassist |
+| music    | 31x | bassist, trumpeter, fingerboard, funk, ensembles, saxophonist |
+| mountain | 18x | boulder, abyss, ranges, alp, horizon, boulders, crevasse |
+| war      | 14x | gunnery, warfare, competitive, besieger, offensives |
+| doctor   | 12x | psychiatry, prevention, hypertension, outpatient, psychosurgery |
+| king     | 11x | maharani, empress, duchess, telecommunication, licence |
+| food     | 10x | scones, cayenne, pork, capsaicin, pepper, noodle, parmesan |
+
+Chained generation (generate a word, add it to the pool if quality is
+high enough, re-sample transversals) produces 15+ consecutive on-topic
+words for strong concepts:
+
+```
+music:  bassist → multitrack → arpeggio → cantata → amplifiers →
+        drummer → recital → singers → fretboard → funk → etude → ...
+
+doctor: psychiatry → chiropody → non-addictive → infirmary →
+        inpatient → pneumonectomy → otc → hypodermic → ...
+```
+
 ---
 
 ## How the pipeline works
@@ -309,7 +344,10 @@ transversal_memory/
 │   ├── cooccurrence_demo.py   # Full pipeline on small dataset
 │   ├── full_dataset_demo.py   # Full Overmann dataset (65K words)
 │   ├── debug_generative.py    # Diagnosis of co-punctal degeneracy
-│   └── fix_generative.py      # Fix experiments (dual projection)
+│   ├── fix_generative.py      # Fix experiments (dual projection)
+│   ├── sequential_prediction.py    # Sequence prediction experiments
+│   ├── associative_generation.py   # Single-transversal generation (baseline)
+│   └── multi_transversal_generation.py  # Multi-transversal generation (works)
 ├── COPUNCTAL_FIX.md           # Detailed writeup of the failure and fix
 ├── tests/
 │   └── test_plucker.py
@@ -346,3 +384,7 @@ transversal_memory/
   but a geometrically coherent one. Analogue of semantic coherence in retrieval.
 - The Gram matrix's eigenvectors are the principal relational axes of a concept —
   not hand-labeled but emergent from the geometry of its associations.
+- A single transversal is a verifier, not a generator — one scalar constraint
+  cannot discriminate a large vocabulary. But multiple transversals intersected
+  act as a generator: each eliminates different false positives, and their
+  intersection converges on genuinely related items.
