@@ -252,8 +252,14 @@ def main():
 
     # ── Step 6: P3Memory — generative retrieval ──────────────────────
     print("\n" + "=" * 70)
-    print("P3Memory — Generative Retrieval (Transversal Decoding)")
+    print("P3Memory — Generative Retrieval (Dual Projection)")
     print("=" * 70)
+    print("  Using dual projection: line(W1·[src;tgt], W2·[src;tgt])")
+    print("  Both endpoints depend on both source and target,")
+    print("  breaking the co-punctal degeneracy of single-projection encoding.")
+
+    from transversal_memory.plucker import plucker_inner, random_projection_dual
+    W1_dual, W2_dual = random_projection_dual(EMBED_DIM, np.random.default_rng(99))
 
     analogy_tests = [
         ("dog",   ["puppy", "bark", "fetch"],     "bone"),
@@ -272,14 +278,14 @@ def main():
 
         stored_lines = []
         for tgt in stored_targets:
-            line = emb.make_line(source, tgt, W)
+            line = emb.make_line_dual(source, tgt, W1_dual, W2_dual)
             if line is not None:
                 stored_lines.append(line)
 
         if len(stored_lines) < 3:
             continue
 
-        q_line = emb.make_line(source, query_target, W)
+        q_line = emb.make_line_dual(source, query_target, W1_dual, W2_dual)
         if q_line is None:
             continue
 
@@ -288,31 +294,40 @@ def main():
         transversals = mem.query_generative(q_line)
 
         if not transversals:
+            print(f"\n  {source}: no transversals found")
             continue
 
         T, resid = transversals[0]
 
+        # Decode by Plücker inner product: lower |pi| = more incident = better
         results = []
         known = set(assoc.get(source, []))
         for word in emb.vocab:
             if word == source:
                 continue
-            line = emb.make_line(source, word, W)
+            line = emb.make_line_dual(source, word, W1_dual, W2_dual)
             if line is None:
                 continue
-            align = abs(float(T @ line))
-            results.append((align, word))
+            pi = abs(plucker_inner(T, line))
+            results.append((pi, word))
 
-        results.sort(key=lambda x: -x[0])
+        results.sort(key=lambda x: x[0])  # ascending: lower |pi| = better
         top = results[:10]
 
+        # Find target rank
+        target_rank = next(
+            (i+1 for i, (_, w) in enumerate(results) if w == query_target),
+            None)
+
         stored_str = ", ".join(stored_targets)
+        n_known = sum(1 for _, w in top if w in known)
         print(f"\n  {source} + [{stored_str}] → query: {query_target}")
-        print(f"    Plücker residual: {resid:.2e}")
-        print(f"    Top decoded words:")
-        for align, word in top:
+        print(f"    Plücker residual: {resid:.2e}  "
+              f"Target rank: {target_rank}/{len(results)}  "
+              f"Known in top 10: {n_known}")
+        for pi_val, word in top:
             marker = "✓" if word in known else " "
-            print(f"      {word:20s} {align:.4f}  {marker}")
+            print(f"      {word:20s} |pi|={pi_val:.2e}  {marker}")
 
     # ── Step 7: Held-out prediction across many words ────────────────
     print("\n" + "=" * 70)

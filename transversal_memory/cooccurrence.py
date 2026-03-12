@@ -237,6 +237,27 @@ class SVDEmbeddings:
                 np.append(b4, 1.0) / np.linalg.norm(np.append(b4, 1.0)),
             )
 
+    def make_line_dual(self,
+                       source: str,
+                       target: str,
+                       W1: np.ndarray,
+                       W2: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Construct a non-degenerate Plücker line for (source → target).
+
+        Uses dual projection: both endpoints depend on both source and target.
+        This breaks the co-punctal degeneracy that makes single-projection
+        encoding useless for generative (transversal) retrieval.
+
+        W1, W2: 4×(2*dim) projection matrices from random_projection_dual().
+        """
+        from .plucker import project_to_line_dual
+        if source not in self.src or target not in self.tgt:
+            return None
+        a = self.src[source]
+        b = self.tgt[target]
+        return project_to_line_dual(a, b, W1, W2)
+
     def similarity(self, a: str, b: str, space: str = "source") -> float:
         """Cosine similarity between two words in source or target space."""
         vecs = self.src if space == "source" else self.tgt

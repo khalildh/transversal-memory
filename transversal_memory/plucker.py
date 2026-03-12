@@ -79,10 +79,58 @@ def project_to_line(a: np.ndarray, b: np.ndarray,
     W    : 4×n projection matrix
 
     Returns a normalised 6-vector.
+
+    WARNING: For a fixed source a, all lines project_to_line(a, b_i, W)
+    share the endpoint W@a, making them co-punctal (plucker_inner = 0
+    for ALL pairs). Use project_to_line_dual() for generative retrieval.
     """
     Wa = W @ np.asarray(a, float)
     Wb = W @ np.asarray(b, float)
     return line_from_points(Wa, Wb)
+
+
+def project_to_line_dual(a: np.ndarray, b: np.ndarray,
+                         W1: np.ndarray, W2: np.ndarray) -> np.ndarray:
+    """
+    Project item-pair (a, b) into P³ via two DIFFERENT matrices,
+    using the concatenation [a; b] for both endpoints.
+
+    Point 1 = W1 @ [a; b]
+    Point 2 = W2 @ [a; b]
+
+    Both endpoints depend on both a and b, breaking the co-punctal
+    degeneracy that makes single-projection encoding useless for
+    generative (transversal) retrieval.
+
+    a, b : n-dimensional item vectors
+    W1   : 4×2n projection matrix
+    W2   : 4×2n projection matrix (must differ from W1)
+
+    Returns a normalised 6-vector.
+    """
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    ab = np.concatenate([a, b])
+    p1 = W1 @ ab
+    p2 = W2 @ ab
+    return line_from_points(p1, p2)
+
+
+def random_projection_dual(n_items: int,
+                           rng: Optional[np.random.Generator] = None
+                           ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Two independent 4×(2*n_items) projection matrices for dual encoding.
+
+    Returns (W1, W2) for use with project_to_line_dual().
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    W1 = rng.standard_normal((4, 2 * n_items))
+    W2 = rng.standard_normal((4, 2 * n_items))
+    for W in (W1, W2):
+        for i in range(4):
+            W[i] /= np.linalg.norm(W[i])
+    return W1, W2
 
 
 # ── Predicates ────────────────────────────────────────────────────────────────
