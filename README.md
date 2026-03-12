@@ -115,13 +115,22 @@ king:
 
 ### Generative retrieval (P3Memory)
 
-The generative mode produces geometrically valid transversals (Plücker
-residuals ~1e-16), but decoding to vocabulary words does not yet work
-well at this scale — the random 4×32 projection to P³ compresses too much
-information for 67K words. This mode works well on smaller vocabularies
-(see `examples/cooccurrence_demo.py` where it correctly retrieves known
-associates from ~130 words). Improving the projection strategy for large
-vocabularies is an open problem.
+Store 3 relational lines, query with a 4th, decode the transversal back
+to vocabulary. Uses **dual projection** encoding (see
+[COPUNCTAL_FIX.md](COPUNCTAL_FIX.md) for why this is necessary).
+
+| Query | Stored | Target | Rank / 67K |
+|-------|--------|--------|-----------|
+| king  | crown, throne, royal | queen | **1** |
+| fire  | flame, heat, burn | smoke | **1** |
+| ocean | waves, deep, salt | fish | **2** |
+| love  | heart, romance, passion | marriage | **2** |
+| music | rhythm, melody, harmony | instrument | **3** |
+| brain | neurons, memory, cortex | intelligence | **3** |
+
+Target word ranks 1–3 out of 67,378 candidates for 6/8 test queries.
+Decoding uses the Plücker inner product: `|⟨T, L⟩| → 0` means the
+candidate line L is incident with the transversal T.
 
 ---
 
@@ -140,12 +149,14 @@ Association Norms          PPMI Matrix              SVD Embeddings
    Plücker Embedding                    Two Retrieval Modes
 ┌──────────────────────┐    ┌─────────────────┬──────────────────────┐
 │ For "dog → puppy":   │    │ GramMemory      │ P3Memory             │
-│                      │    │                 │                      │
-│ a = U[dog]    ∈ R³²  │    │ M = Σ pᵢ⊗pᵢ    │ Store 3 + query 1    │
-│ b = V[puppy]  ∈ R³²  │───▶│ score = cᵀMc   │ → 2 transversals     │
-│                      │    │                 │                      │
-│ p = Wa ∧ Wb ∈ R⁶    │    │ 94.6% held-out  │ exact algebra,       │
-│ (Plücker 6-vector)   │    │ separation      │ no optimisation      │
+│                      │    │ (single proj)   │ (dual projection)    │
+│ a = U[dog]    ∈ R³²  │    │                 │                      │
+│ b = V[puppy]  ∈ R³²  │    │ p = Wa ∧ Wb     │ p = W1[a;b] ∧ W2[a;b]│
+│                      │───▶│ M = Σ pᵢ⊗pᵢ    │ Store 3 + query 1    │
+│                      │    │ score = cᵀMc   │ → 2 transversals     │
+│ (Plücker 6-vector)   │    │                 │                      │
+│                      │    │ 94.6% held-out  │ target ranks 1-3     │
+│                      │    │ separation      │ out of 67K vocab     │
 └──────────────────────┘    └─────────────────┴──────────────────────┘
 ```
 
@@ -154,6 +165,9 @@ Key design choices:
   generic associates that co-occur with everything
 - **Separate U/V vectors** from SVD preserve the directionality of associations
   (U = cue role, V = associate role)
+- **Dual projection** for generative retrieval — both endpoints of the Plücker
+  line depend on both source and target, avoiding co-punctal degeneracy
+  (see [COPUNCTAL_FIX.md](COPUNCTAL_FIX.md))
 - **Sparse matrix + truncated SVD** (scipy) handles 67K×67K vocabulary
   in seconds with minimal memory
 - **Pickle checkpointing** caches the embeddings so subsequent runs are instant
@@ -293,7 +307,10 @@ transversal_memory/
 │   ├── capital_cities.py      # Analogy: Paris:France :: Madrid:Spain
 │   ├── word_associations.py   # Word association scoring + generation
 │   ├── cooccurrence_demo.py   # Full pipeline on small dataset
-│   └── full_dataset_demo.py   # Full Overmann dataset (65K words)
+│   ├── full_dataset_demo.py   # Full Overmann dataset (65K words)
+│   ├── debug_generative.py    # Diagnosis of co-punctal degeneracy
+│   └── fix_generative.py      # Fix experiments (dual projection)
+├── COPUNCTAL_FIX.md           # Detailed writeup of the failure and fix
 ├── tests/
 │   └── test_plucker.py
 └── data/                      # (created on first run)
