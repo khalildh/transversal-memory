@@ -1,0 +1,13 @@
+[project]
+name = "transversal-memory"
+version = "0.1.0"
+description = "Content-addressable memory via projective geometry and Schubert calculus"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
