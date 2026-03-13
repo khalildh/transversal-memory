@@ -1,24 +1,26 @@
 """
-experiment.py — 10-signal RRF with covariance-based scoring
-Best: p@10=0.1230 (66.2% lift over cosine NN baseline of 0.074)
+experiment.py — 8-signal RRF with covariance-based scoring
+Best: p@10=0.1280 (73.0% lift over cosine NN baseline of 0.074)
 
-Signals:
+Signals (after ablation-driven pruning):
   1. Cosine similarity to source (src embedding)
   2. Cosine similarity to source (tgt embedding)
-  3. Cosine similarity to centroid of associates
-  4. Max similarity to any associate
-  5. Mean similarity to all associates
-  6. Top-3 mean similarity to closest associates
-  7. Reciprocal NN: per-associate rank fusion
-  8. Mahalanobis distance to centroid (associate covariance)
-  9. Whitened cosine: cosine in covariance-normalized space
- 10. Mahalanobis distance to source (associate covariance)
+  3. Max similarity to any associate
+  4. Mean similarity to all associates
+  5. Reciprocal NN: per-associate rank fusion
+  6. Mahalanobis distance to centroid (associate covariance)
+  7. Whitened cosine: cosine in covariance-normalized space
+  8. Mahalanobis distance to source (associate covariance)
+
+Removed (hurt performance via signal dilution):
+  - Cosine to centroid: redundant with Mahalanobis to centroid
+  - Top-3 mean: redundant with max + mean signals
 """
 
 import numpy as np
 
 RRF_K = 13
-RECIP_K = 24
+RECIP_K = 32
 MAHA_REG = 0.001
 
 
@@ -97,36 +99,25 @@ def rank(source, state, emb, exclude):
     if source_tgt is not None:
         rrf_scores += _rrf_ranks(tgt_mat @ source_tgt)
 
-    # Signal 3: Cosine to centroid
-    if centroid is not None:
-        rrf_scores += _rrf_ranks(tgt_mat @ centroid)
-
     if assoc_mat is not None:
         sim_matrix = tgt_mat @ assoc_mat.T
 
-        # Signal 4: Max similarity to any associate
+        # Signal 3: Max similarity to any associate
         rrf_scores += _rrf_ranks(sim_matrix.max(axis=1))
 
-        # Signal 5: Mean similarity to all associates
+        # Signal 4: Mean similarity to all associates
         rrf_scores += _rrf_ranks(sim_matrix.mean(axis=1))
 
-        # Signal 6: Top-3 mean similarity
-        if assoc_mat.shape[0] >= 3:
-            top3 = np.partition(sim_matrix, -3, axis=1)[:, -3:]
-            rrf_scores += _rrf_ranks(top3.mean(axis=1))
-        else:
-            rrf_scores += _rrf_ranks(sim_matrix.mean(axis=1))
-
-        # Signal 7: Reciprocal nearest-neighbor fusion
+        # Signal 5: Reciprocal nearest-neighbor fusion
         rrf_scores += _rrf_ranks(_recip_nn(sim_matrix))
 
-    # Signal 8: Mahalanobis distance to centroid
+    # Signal 6: Mahalanobis distance to centroid
     if inv_cov is not None and centroid is not None:
         diff = tgt_mat - centroid[None, :]
         maha_dist = np.sum((diff @ inv_cov) * diff, axis=1)
         rrf_scores += _rrf_ranks(maha_dist, ascending=True)
 
-    # Signal 9: Whitened cosine to centroid
+    # Signal 7: Whitened cosine to centroid
     if sqrt_inv_cov is not None and centroid is not None:
         w_tgt = tgt_mat @ sqrt_inv_cov
         w_cent = centroid @ sqrt_inv_cov
@@ -134,7 +125,7 @@ def rank(source, state, emb, exclude):
         w_cos = w_tgt @ w_cent / (norms + 1e-12)
         rrf_scores += _rrf_ranks(w_cos)
 
-    # Signal 10: Mahalanobis distance to source
+    # Signal 8: Mahalanobis distance to source
     if inv_cov is not None:
         diff = tgt_mat - source_vec[None, :]
         maha_src = np.sum((diff @ inv_cov) * diff, axis=1)
