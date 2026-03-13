@@ -1,6 +1,6 @@
 """
-experiment.py — 7-signal RRF with reciprocal nearest-neighbor fusion
-Best: p@10=0.1135 (53.4% lift over cosine NN baseline of 0.074)
+experiment.py — 8-signal RRF with Mahalanobis distance
+Best: p@10=0.1190 (60.8% lift over cosine NN baseline of 0.074)
 
 Signals:
   1. Cosine similarity to source (src embedding)
@@ -10,12 +10,14 @@ Signals:
   5. Mean similarity to all associates
   6. Top-3 mean similarity to closest associates
   7. Reciprocal NN: per-associate rank fusion
+  8. Mahalanobis distance to centroid (associate covariance)
 """
 
 import numpy as np
 
 RRF_K = 13
 RECIP_K = 24
+MAHA_REG = 0.001
 
 
 def build(source, train_associates, emb):
@@ -26,16 +28,24 @@ def build(source, train_associates, emb):
 
     centroid = None
     assoc_mat = None
+    inv_cov = None
     if assoc_vecs:
         centroid = np.mean(assoc_vecs, axis=0)
         centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
         assoc_mat = np.stack(assoc_vecs)
+        if len(assoc_vecs) >= 5:
+            cov = np.cov(assoc_mat.T) + MAHA_REG * np.eye(assoc_mat.shape[1])
+            try:
+                inv_cov = np.linalg.inv(cov)
+            except np.linalg.LinAlgError:
+                pass
 
     return {
         "source_vec": emb.src[source],
         "source_tgt": emb.tgt.get(source, None),
         "centroid": centroid,
         "assoc_mat": assoc_mat,
+        "inv_cov": inv_cov,
     }
 
 
@@ -48,12 +58,7 @@ def _rrf_ranks(raw_scores, ascending=False):
 
 
 def _recip_nn(sim_matrix):
-    """Per-associate reciprocal rank fusion.
-
-    For each associate, rank all candidates by similarity, then sum
-    1/(RECIP_K + rank) across associates. This captures how consistently
-    a candidate appears near multiple associates.
-    """
+    """Per-associate reciprocal rank fusion."""
     N, M = sim_matrix.shape
     recip = np.zeros(N)
     for j in range(M):
@@ -69,6 +74,7 @@ def rank(source, state, emb, exclude):
     source_tgt = state["source_tgt"]
     centroid = state["centroid"]
     assoc_mat = state["assoc_mat"]
+    inv_cov = state["inv_cov"]
 
     all_words = [w for w in emb.vocab if w not in exclude and w in emb.tgt]
     tgt_mat = np.stack([emb.tgt[w] for w in all_words])
@@ -105,6 +111,12 @@ def rank(source, state, emb, exclude):
 
         # Signal 7: Reciprocal nearest-neighbor fusion
         rrf_scores += _rrf_ranks(_recip_nn(sim_matrix))
+
+    # Signal 8: Mahalanobis distance to centroid
+    if inv_cov is not None and centroid is not None:
+        diff = tgt_mat - centroid[None, :]
+        maha_dist = np.sum((diff @ inv_cov) * diff, axis=1)
+        rrf_scores += _rrf_ranks(maha_dist, ascending=True)
 
     order = np.argsort(-rrf_scores)
     return [(float(rrf_scores[i]), all_words[i]) for i in order]

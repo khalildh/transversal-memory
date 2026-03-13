@@ -442,9 +442,9 @@ Using the `evaluate.py` harness (200 test words, 25% holdout, 67K vocabulary),
 autonomous experimentation explored how to rank the full vocabulary to recover
 held-out associates.
 
-### Best result: 7-signal RRF (p@10 = 0.1135, **53% lift** over cosine NN)
+### Best result: 8-signal RRF (p@10 = 0.1190, **61% lift** over cosine NN)
 
-The winning approach uses **Reciprocal Rank Fusion** (RRF) across 7 complementary
+The winning approach uses **Reciprocal Rank Fusion** (RRF) across 8 complementary
 embedding-based signals:
 
 | Signal | Description |
@@ -455,13 +455,19 @@ embedding-based signals:
 | max-sim | Max similarity to any training associate |
 | mean-sim | Mean similarity to all training associates |
 | top-3 mean | Mean similarity to 3 closest associates |
-| **recip-NN** | Per-associate reciprocal rank fusion (key discovery) |
+| **recip-NN** | Per-associate reciprocal rank fusion |
+| **Mahalanobis** | Distance to centroid using associate covariance |
 
 Each signal produces a ranking; RRF converts each to `1/(K + rank)` and sums.
-The reciprocal NN signal is the key discovery: for each associate, rank all 67K
-candidates by similarity, then sum `1/(K' + rank)` across associates. This
-captures how **consistently** a candidate appears near **multiple** associates,
-providing a fundamentally different signal from aggregate statistics.
+
+Two key discoveries:
+- **Reciprocal NN**: for each associate, rank all 67K candidates by similarity,
+  then sum `1/(K' + rank)` across associates. Captures how **consistently** a
+  candidate appears near **multiple** associates.
+- **Mahalanobis distance**: uses the inverse covariance of associate embeddings
+  to measure distance to centroid, capturing the **shape** of the associate
+  cluster (not just its center). Words that fall within the ellipsoidal envelope
+  of associates score higher than equidistant words outside it.
 
 ### Results progression
 
@@ -473,7 +479,8 @@ providing a fundamentally different signal from aggregate statistics.
 | 4-signal RRF (cos+cent+max+avg) | 0.100 | 1.35x | RRF fusion beats linear blend |
 | 5-signal RRF (+top-3 mean) | 0.104 | 1.40x | Focused similarity helps |
 | 6-signal RRF (+source tgt space) | 0.108 | 1.46x | src/tgt asymmetry adds signal |
-| **7-signal RRF (+recip-NN)** | **0.114** | **1.53x** | Per-associate rank fusion |
+| 7-signal RRF (+recip-NN) | 0.114 | 1.53x | Per-associate rank fusion |
+| **8-signal RRF (+Mahalanobis)** | **0.119** | **1.61x** | Covariance captures cluster shape |
 
 ### Key findings
 
@@ -482,8 +489,8 @@ providing a fundamentally different signal from aggregate statistics.
    actively degrades performance through signal saturation.
 
 2. **RRF fusion is robust**: Uniform signal weights are optimal. Attempts to
-   tune weights, use alternative fusion methods (Borda, CombMNZ, geometric mean),
-   or add >7 signals all hurt performance.
+   tune weights or use alternative fusion methods (Borda, CombMNZ, geometric mean)
+   all hurt performance. K parameters matter: RRF_K=13, RECIP_K=24, MAHA_REG=0.001.
 
 3. **Source/target asymmetry matters**: The SVD embeddings have separate source
    (U) and target (V) vectors. Using both perspectives on the source word adds
@@ -493,5 +500,7 @@ providing a fundamentally different signal from aggregate statistics.
    consistency — a word that ranks well from the perspective of *many* associates
    is more likely to be a true associate than one that ranks highly from just one.
 
-5. **Tuned K parameters**: RRF_K=13 (more aggressive top-weighting) and
-   RECIP_K=24 (slightly smoothed reciprocal) are optimal.
+5. **Mahalanobis captures cluster geometry**: The inverse covariance of associate
+   embeddings defines an ellipsoidal decision boundary. This outperforms isotropic
+   (centroid-only) distance by accounting for the shape and orientation of the
+   associate distribution in 32D embedding space.

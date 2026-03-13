@@ -27,7 +27,8 @@
 - 4-signal RRF (cos+cent+max+avg): p@10 = 0.100 (+35.1%)
 - 5-signal RRF (+top-3 mean): p@10 = 0.104 (+40.5%)
 - 6-signal RRF (+source tgt space): p@10 = 0.108 (+45.9%)
-- **7-signal RRF (+reciprocal NN): p@10 = 0.114 (+53.4%)**
+- 7-signal RRF (+reciprocal NN): p@10 = 0.114 (+53.4%)
+- **8-signal RRF (+Mahalanobis): p@10 = 0.119 (+60.8%)**
 
 ## Open questions
 
