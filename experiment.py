@@ -1,6 +1,6 @@
 """
-experiment.py — 8-signal RRF with Mahalanobis distance
-Best: p@10=0.1190 (60.8% lift over cosine NN baseline of 0.074)
+experiment.py — 10-signal RRF with covariance-based scoring
+Best: p@10=0.1230 (66.2% lift over cosine NN baseline of 0.074)
 
 Signals:
   1. Cosine similarity to source (src embedding)
@@ -11,6 +11,8 @@ Signals:
   6. Top-3 mean similarity to closest associates
   7. Reciprocal NN: per-associate rank fusion
   8. Mahalanobis distance to centroid (associate covariance)
+  9. Whitened cosine: cosine in covariance-normalized space
+ 10. Mahalanobis distance to source (associate covariance)
 """
 
 import numpy as np
@@ -29,6 +31,7 @@ def build(source, train_associates, emb):
     centroid = None
     assoc_mat = None
     inv_cov = None
+    sqrt_inv_cov = None
     if assoc_vecs:
         centroid = np.mean(assoc_vecs, axis=0)
         centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
@@ -37,6 +40,9 @@ def build(source, train_associates, emb):
             cov = np.cov(assoc_mat.T) + MAHA_REG * np.eye(assoc_mat.shape[1])
             try:
                 inv_cov = np.linalg.inv(cov)
+                vals, vecs = np.linalg.eigh(inv_cov)
+                vals = np.maximum(vals, 0)
+                sqrt_inv_cov = vecs @ np.diag(np.sqrt(vals)) @ vecs.T
             except np.linalg.LinAlgError:
                 pass
 
@@ -46,6 +52,7 @@ def build(source, train_associates, emb):
         "centroid": centroid,
         "assoc_mat": assoc_mat,
         "inv_cov": inv_cov,
+        "sqrt_inv_cov": sqrt_inv_cov,
     }
 
 
@@ -75,6 +82,7 @@ def rank(source, state, emb, exclude):
     centroid = state["centroid"]
     assoc_mat = state["assoc_mat"]
     inv_cov = state["inv_cov"]
+    sqrt_inv_cov = state["sqrt_inv_cov"]
 
     all_words = [w for w in emb.vocab if w not in exclude and w in emb.tgt]
     tgt_mat = np.stack([emb.tgt[w] for w in all_words])
@@ -117,6 +125,20 @@ def rank(source, state, emb, exclude):
         diff = tgt_mat - centroid[None, :]
         maha_dist = np.sum((diff @ inv_cov) * diff, axis=1)
         rrf_scores += _rrf_ranks(maha_dist, ascending=True)
+
+    # Signal 9: Whitened cosine to centroid
+    if sqrt_inv_cov is not None and centroid is not None:
+        w_tgt = tgt_mat @ sqrt_inv_cov
+        w_cent = centroid @ sqrt_inv_cov
+        norms = np.linalg.norm(w_tgt, axis=1) * np.linalg.norm(w_cent)
+        w_cos = w_tgt @ w_cent / (norms + 1e-12)
+        rrf_scores += _rrf_ranks(w_cos)
+
+    # Signal 10: Mahalanobis distance to source
+    if inv_cov is not None:
+        diff = tgt_mat - source_vec[None, :]
+        maha_src = np.sum((diff @ inv_cov) * diff, axis=1)
+        rrf_scores += _rrf_ranks(maha_src, ascending=True)
 
     order = np.argsort(-rrf_scores)
     return [(float(rrf_scores[i]), all_words[i]) for i in order]

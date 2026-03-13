@@ -442,9 +442,9 @@ Using the `evaluate.py` harness (200 test words, 25% holdout, 67K vocabulary),
 autonomous experimentation explored how to rank the full vocabulary to recover
 held-out associates.
 
-### Best result: 8-signal RRF (p@10 = 0.1190, **61% lift** over cosine NN)
+### Best result: 10-signal RRF (p@10 = 0.1230, **66% lift** over cosine NN)
 
-The winning approach uses **Reciprocal Rank Fusion** (RRF) across 8 complementary
+The winning approach uses **Reciprocal Rank Fusion** (RRF) across 10 complementary
 embedding-based signals:
 
 | Signal | Description |
@@ -456,7 +456,9 @@ embedding-based signals:
 | mean-sim | Mean similarity to all training associates |
 | top-3 mean | Mean similarity to 3 closest associates |
 | **recip-NN** | Per-associate reciprocal rank fusion |
-| **Mahalanobis** | Distance to centroid using associate covariance |
+| **Mahalanobis-cent** | Distance to centroid using associate covariance |
+| **whitened-cos** | Cosine in covariance-normalized space |
+| **Mahalanobis-src** | Distance to source using associate covariance |
 
 Each signal produces a ranking; RRF converts each to `1/(K + rank)` and sums.
 
@@ -480,7 +482,8 @@ Two key discoveries:
 | 5-signal RRF (+top-3 mean) | 0.104 | 1.40x | Focused similarity helps |
 | 6-signal RRF (+source tgt space) | 0.108 | 1.46x | src/tgt asymmetry adds signal |
 | 7-signal RRF (+recip-NN) | 0.114 | 1.53x | Per-associate rank fusion |
-| **8-signal RRF (+Mahalanobis)** | **0.119** | **1.61x** | Covariance captures cluster shape |
+| 8-signal RRF (+Mahalanobis) | 0.119 | 1.61x | Covariance captures cluster shape |
+| **10-signal RRF (+whitened cos, maha-src)** | **0.123** | **1.66x** | Full covariance exploitation |
 
 ### Key findings
 

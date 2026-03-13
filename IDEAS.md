@@ -28,7 +28,8 @@
 - 5-signal RRF (+top-3 mean): p@10 = 0.104 (+40.5%)
 - 6-signal RRF (+source tgt space): p@10 = 0.108 (+45.9%)
 - 7-signal RRF (+reciprocal NN): p@10 = 0.114 (+53.4%)
-- **8-signal RRF (+Mahalanobis): p@10 = 0.119 (+60.8%)**
+- 8-signal RRF (+Mahalanobis): p@10 = 0.119 (+60.8%)
+- **10-signal RRF (+whitened cos, maha-src): p@10 = 0.123 (+66.2%)**
 
 ## Open questions
 
