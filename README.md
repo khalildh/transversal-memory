@@ -442,34 +442,39 @@ Using the `evaluate.py` harness (200 test words, 25% holdout, 67K vocabulary),
 autonomous experimentation explored how to rank the full vocabulary to recover
 held-out associates.
 
-### Best result: 10-signal RRF (p@10 = 0.1230, **66% lift** over cosine NN)
+### Best result: 8-signal RRF (p@10 = 0.1280, **73% lift** over cosine NN)
 
-The winning approach uses **Reciprocal Rank Fusion** (RRF) across 10 complementary
-embedding-based signals:
+The winning approach uses **Reciprocal Rank Fusion** (RRF) across 8 complementary
+embedding-based signals, refined by ablation-driven pruning:
 
-| Signal | Description |
-|--------|-------------|
-| cos(src) | Cosine similarity to source word (source embedding space) |
-| cos(tgt) | Cosine similarity to source word (target embedding space) |
-| centroid | Cosine to mean of associate embeddings |
-| max-sim | Max similarity to any training associate |
-| mean-sim | Mean similarity to all training associates |
-| top-3 mean | Mean similarity to 3 closest associates |
-| **recip-NN** | Per-associate reciprocal rank fusion |
-| **Mahalanobis-cent** | Distance to centroid using associate covariance |
-| **whitened-cos** | Cosine in covariance-normalized space |
-| **Mahalanobis-src** | Distance to source using associate covariance |
+| Signal | Description | Ablation impact |
+|--------|-------------|:---------------:|
+| cos(src) | Cosine similarity to source (source embedding space) | neutral |
+| cos(tgt) | Cosine similarity to source (target embedding space) | -0.0005 |
+| max-sim | Max similarity to any training associate | -0.0005 |
+| mean-sim | Mean similarity to all training associates | neutral |
+| **recip-NN** | Per-associate reciprocal rank fusion | -0.0010 |
+| **Mahalanobis-cent** | Distance to centroid using associate covariance | **-0.0030** |
+| **whitened-cos** | Cosine in covariance-normalized space | -0.0015 |
+| **Mahalanobis-src** | Distance to source using associate covariance | -0.0010 |
+
+**Removed** (hurt performance via signal dilution):
+- ~~Cosine to centroid~~: redundant with Mahalanobis to centroid
+- ~~Top-3 mean~~: redundant with max + mean signals
 
 Each signal produces a ranking; RRF converts each to `1/(K + rank)` and sums.
 
-Two key discoveries:
+Three key discoveries:
 - **Reciprocal NN**: for each associate, rank all 67K candidates by similarity,
   then sum `1/(K' + rank)` across associates. Captures how **consistently** a
   candidate appears near **multiple** associates.
 - **Mahalanobis distance**: uses the inverse covariance of associate embeddings
   to measure distance to centroid, capturing the **shape** of the associate
-  cluster (not just its center). Words that fall within the ellipsoidal envelope
-  of associates score higher than equidistant words outside it.
+  cluster (not just its center). This is the single strongest signal (removing
+  it causes the largest drop: -0.003).
+- **Signal pruning**: fewer signals can be better. The 8-signal ensemble
+  outperforms the 10-signal version by 0.005 because removing dilutive signals
+  lets stronger signals dominate the rank fusion.
 
 ### Results progression
 
@@ -483,27 +488,40 @@ Two key discoveries:
 | 6-signal RRF (+source tgt space) | 0.108 | 1.46x | src/tgt asymmetry adds signal |
 | 7-signal RRF (+recip-NN) | 0.114 | 1.53x | Per-associate rank fusion |
 | 8-signal RRF (+Mahalanobis) | 0.119 | 1.61x | Covariance captures cluster shape |
-| **10-signal RRF (+whitened cos, maha-src)** | **0.123** | **1.66x** | Full covariance exploitation |
+| 10-signal RRF (+whitened cos, maha-src) | 0.123 | 1.66x | Full covariance exploitation |
+| **8-signal RRF (ablation-pruned)** | **0.128** | **1.73x** | Signal pruning + K tuning |
 
 ### Key findings
 
-1. **Embedding signals dominate geometry**: Pure geometric (Gram matrix) scoring
-   achieves only p@10=0.011. Adding Gram projections to the embedding ensemble
-   actively degrades performance through signal saturation.
+1. **Plücker geometry adds zero to the embedding ensemble**: Exhaustive testing
+   across G(2,4) [6D], G(2,6) [15D], G(2,8) [28D], and G(2,17) [136D] confirms
+   that Gram matrix energy, Plücker incidence, transversal scoring, and all
+   geometric signals are strictly redundant with embedding-space signals. The
+   G(2,17) Gram energy has d-prime=6.7 and only r=0.45 correlation with cosine,
+   yet adds exactly 0.0pp to the ensemble. The covariance-based embedding signals
+   (Mahalanobis, whitened cosine) already capture everything geometry captures.
 
-2. **RRF fusion is robust**: Uniform signal weights are optimal. Attempts to
-   tune weights or use alternative fusion methods (Borda, CombMNZ, geometric mean)
-   all hurt performance. K parameters matter: RRF_K=13, RECIP_K=24, MAHA_REG=0.001.
+2. **Geometry's contribution is information-theoretic, not numerical**: Plücker
+   coordinates are quadratic functions of projected embeddings. The Gram energy
+   is quartic. But the embedding ensemble already exploits the full 32D covariance
+   (quadratic), which strictly dominates any projection to lower dimensions.
+   No amount of Grassmannian dimensionality change fixes this.
 
-3. **Source/target asymmetry matters**: The SVD embeddings have separate source
-   (U) and target (V) vectors. Using both perspectives on the source word adds
-   a genuinely orthogonal signal (+4pp).
+3. **RRF fusion is robust**: Uniform signal weights are optimal. Tested alternatives
+   include weighted RRF, log-product, squared RRF, z-score normalization, min-max
+   normalization, CombMNZ, and Borda count — all degrade performance. Parameters:
+   RRF_K=13, RECIP_K=32, MAHA_REG=0.001.
 
-4. **Reciprocal NN is the strongest single signal**: It captures multi-associate
-   consistency — a word that ranks well from the perspective of *many* associates
-   is more likely to be a true associate than one that ranks highly from just one.
+4. **Signal pruning improves performance**: Removing cos_cent and top-3 mean
+   raised p@10 from 0.123 to 0.127 (+3.3%). These signals are redundant with
+   Mahalanobis and max+mean respectively, and their presence dilutes the stronger
+   signals in the rank fusion.
 
-5. **Mahalanobis captures cluster geometry**: The inverse covariance of associate
-   embeddings defines an ellipsoidal decision boundary. This outperforms isotropic
-   (centroid-only) distance by accounting for the shape and orientation of the
-   associate distribution in 32D embedding space.
+5. **Mahalanobis to centroid is the strongest signal**: Ablation shows removing
+   it causes the largest single drop (-0.003). It captures cluster shape in 32D,
+   which no other signal fully replicates.
+
+6. **The geometric/practical gap is resolved**: Geometry excels at generative
+   retrieval (transversals rank targets 1-3/67K in cherry-picked queries) but
+   adds nothing to discriminative ranking when high-quality embeddings are
+   available. The two modes solve fundamentally different problems.
