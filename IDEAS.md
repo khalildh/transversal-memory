@@ -31,9 +31,33 @@
 - 8-signal RRF (+Mahalanobis): p@10 = 0.119 (+60.8%)
 - **10-signal RRF (+whitened cos, maha-src): p@10 = 0.123 (+66.2%)**
 
+## Resolved questions
+
+- **Does higher Grassmannian help the hybrid?** No. Gram matrix scores from
+  G(2,4), G(2,6), and G(2,8) all add zero unique information when the full
+  32D embedding covariance is exploited. The Gram matrix in 15D Plücker space
+  is a lossy compression of the 32×32 covariance — strictly dominated.
+
+- **Can we ensemble across Grassmannian dimensions?** Tested G(2,4)+G(2,6)+G(2,8)
+  simultaneously. Zero improvement over embedding-only approach.
+
+- **Gram eigenstructure as features?** PCA of the Gram matrix in Plücker space
+  provides no additive signal over embedding-space PCA/covariance.
+
 ## Open questions
 
-- Does higher Grassmannian (G(2,6)) help the hybrid approach?
-- Can we ensemble across multiple Grassmannian dimensions?
-- Is there a principled way to set alpha (not just grid search)?
-- What about using the Gram matrix eigenstructure as additional features?
+- **Where does geometry uniquely contribute?** Generative retrieval (transversals
+  rank 1-3 out of 67K) is geometry's strength. Can this be used as a re-ranker
+  for the top-100 candidates from the embedding ensemble?
+
+- **Is the Plücker relation a useful constraint?** The quadratic Plücker relation
+  `p₀₁p₂₃ - p₀₂p₁₃ + p₀₃p₁₂ = 0` constrains valid lines. Could enforcing this
+  during ranking eliminate false positives that embedding methods miss?
+
+- **Cross-word geometry**: The Gram matrix comparison (e.g., dog/cat similarity
+  = 0.86) captures relational structure. Can this be used for zero-shot transfer
+  of associate patterns between related source words?
+
+- **Sequence prediction**: Can transversals predict next tokens in sequences?
+  The geometric constraint (must intersect all context lines) is analogous to
+  attention. Worth testing on BPE-tokenized text.
