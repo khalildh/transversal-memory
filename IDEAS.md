@@ -90,6 +90,33 @@
   outperforms Ledoit-Wolf shrinkage by 0.009pp. With only 12-74 training
   associates in 32D, the simple ridge estimate is more stable.
 
+## Geometry beats embeddings at associate expansion (K≥10)
+
+The generative benchmark (exp_generative_benchmark.py) reveals that multi-seed
+Gram^0.05 **outperforms all embedding methods** when given ≥10 seed associates:
+
+  | K (seeds) | Best embedding | Gram^0.05 | Winner    |
+  |-----------|---------------|-----------|-----------|
+  | 3         | 0.2565        | 0.1550    | EMBEDDING |
+  | 5         | 0.2380        | 0.2020    | EMBEDDING |
+  | 7         | 0.2215        | 0.2165    | ~TIE      |
+  | 10        | 0.1975        | 0.2090    | GEOMETRY  |
+  | 15        | 0.1713        | 0.1798    | GEOMETRY  |
+  | 20        | 0.1422        | 0.1490    | GEOMETRY  |
+
+RRF blend (cos + centroid + max + Gram) is best at every K≥5.
+
+Why the crossover? Geometry operates in 6D (Plücker), needing fewer samples
+to estimate structure than 32D Mahalanobis. At K<7, too few lines for a
+meaningful Gram matrix. At K≥10, the 6D representation is well-estimated
+while 32D covariance is still noisy.
+
+This resolves the "generative vs discriminative" question: geometry adds
+unique information in medium-data regimes. The discriminative benchmark
+(evaluate.py) trains on 12-50 associates, where covariance is already stable
+and geometry adds zero. But at K=10-20, geometry wins standalone and adds
+unique signal in fusion.
+
 ## Open questions
 
 - **Cross-word geometry**: The Gram matrix comparison (e.g., dog/cat similarity
@@ -100,9 +127,9 @@
   The geometric constraint (must intersect all context lines) is analogous to
   attention. Worth testing on BPE-tokenized text.
 
-- **Generative vs discriminative**: Geometry excels at generation (transversals
-  create new relational items) but fails at discrimination (ranking existing
-  items). Is there a task where generative retrieval is the primary mode?
+- **Optimal K regime**: Geometry crosses over at K≈7-10. Can the Gram ensemble
+  be made more sample-efficient (fewer seeds needed) via better projection
+  selection, adaptive power transforms, or Bayesian Gram estimation?
 
 - **Higher-order interactions**: The embedding ensemble captures up to 2nd-order
   (covariance) structure. Could non-linear kernels or tensor decompositions
