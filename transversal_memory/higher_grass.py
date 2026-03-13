@@ -137,6 +137,103 @@ def hodge_dual_general(p: np.ndarray, n_proj: int) -> np.ndarray:
     return J @ p
 
 
+def hodge_matrix_general(n_proj: int) -> np.ndarray:
+    """
+    Build the D×D Hodge dual matrix J for G(2, n+1).
+    Cached version — call once, reuse for batch scoring.
+
+    plucker_inner(p, q) = p @ J @ q
+    """
+    from .plucker import _J6
+    if n_proj == 3:
+        return _J6.copy()
+
+    n1 = n_proj + 1
+    D = plucker_dim(n_proj)
+    pairs = list(combinations(range(n1), 2))
+    idx_map = {ij: k for k, ij in enumerate(pairs)}
+
+    J = np.zeros((D, D))
+    for a, b, c, d in combinations(range(n1), 4):
+        ab, cd = idx_map[(a,b)], idx_map[(c,d)]
+        ac, bd = idx_map[(a,c)], idx_map[(b,d)]
+        ad, bc = idx_map[(a,d)], idx_map[(b,c)]
+        J[ab, cd] += 1; J[cd, ab] += 1
+        J[ac, bd] -= 1; J[bd, ac] -= 1
+        J[ad, bc] += 1; J[bc, ad] += 1
+
+    return J
+
+
+def batch_encode_lines_dual_general(source: np.ndarray,
+                                     targets: np.ndarray,
+                                     W1: np.ndarray,
+                                     W2: np.ndarray,
+                                     n_proj: int) -> np.ndarray:
+    """
+    Encode all (source, target_i) pairs as Plücker lines in G(2, n+1).
+
+    source  : (d,) source embedding
+    targets : (N, d) target embeddings
+    W1, W2  : (n+1, 2d) projection matrices
+    n_proj  : projective dimension
+
+    Returns (N, D) array of normalised Plücker lines, D = C(n+1, 2).
+    """
+    N, d = targets.shape
+    n1 = n_proj + 1
+    D = plucker_dim(n_proj)
+    pairs = list(combinations(range(n1), 2))
+
+    # Build (N, 2d) concatenated vectors
+    src_tile = np.tile(source, (N, 1))
+    ab = np.hstack([src_tile, targets])  # (N, 2d)
+
+    # Project to R^(n+1)
+    P1 = ab @ W1.T  # (N, n+1)
+    P2 = ab @ W2.T  # (N, n+1)
+
+    # Exterior product for all D pairs
+    lines = np.empty((N, D))
+    for k, (i, j) in enumerate(pairs):
+        lines[:, k] = P1[:, i] * P2[:, j] - P1[:, j] * P2[:, i]
+
+    # Normalise
+    norms = np.linalg.norm(lines, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    lines /= norms
+
+    return lines
+
+
+def batch_score_transversals_general(transversals: np.ndarray,
+                                      lines: np.ndarray,
+                                      J: np.ndarray,
+                                      method: str = "sum_log") -> np.ndarray:
+    """
+    Score all lines against all transversals in G(2, n+1).
+
+    transversals : (T, D) array
+    lines        : (N, D) array
+    J            : (D, D) Hodge dual matrix from hodge_matrix_general()
+    method       : "sum_log", "mean", or "max"
+
+    Returns (N,) score array.
+    """
+    Jlines = lines @ J.T  # (N, D)
+    pi = np.abs(transversals @ Jlines.T)  # (T, N)
+
+    eps = 1e-20
+    if method == "sum_log":
+        return np.log(pi + eps).sum(axis=0)
+    elif method == "mean":
+        return pi.mean(axis=0)
+    elif method == "max":
+        return pi.max(axis=0)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+
 def project_to_line_general(a: np.ndarray, b: np.ndarray,
                             W: np.ndarray,
                             n_proj: int) -> np.ndarray:

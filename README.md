@@ -270,9 +270,19 @@ G(2,6) generation:
   ocean:    seaside, tides, barnacle, seagulls
 ```
 
-The trade-off: G(2,6) needs 14 lines per query (vs 5 for G(2,4)) and takes
-~50s per word (vs ~3s). But 15D provides enough geometric room to discriminate
-67K items with fewer multi-transversal samples needed.
+### Batch vectorisation
+
+Vocabulary ranking is fully vectorised: all 67K lines are encoded in a single
+matrix multiply `(N, 2d) @ (2d, n+1)`, then scored against all transversals
+with `(T, D) @ (D, N)`. No Python loops over the vocabulary.
+
+| Grassmannian | Before (loop) | After (batch) | Speedup |
+|--------------|:-------------:|:-------------:|:-------:|
+| G(2,4) 20T   | ~3s           | 0.018s        | ~170×   |
+| G(2,6) 10T   | ~50s          | 0.017s        | ~3000×  |
+
+G(2,6) needs 14 lines per query (vs 5 for G(2,4)), but 15D provides enough
+geometric room to discriminate 67K items with fewer multi-transversal samples.
 
 G(2,5) performs worse than G(2,4) — likely a Hodge dual formulation issue
 in 10D. This is an open problem.

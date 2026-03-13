@@ -26,7 +26,9 @@ import numpy as np
 sys.path.insert(0, "..")
 
 from transversal_memory import P3Memory, plucker_inner
-from transversal_memory.plucker import random_projection_dual
+from transversal_memory.plucker import (
+    random_projection_dual, batch_encode_lines_dual, batch_score_transversals,
+)
 from transversal_memory.cooccurrence import SVDEmbeddings
 
 
@@ -88,37 +90,32 @@ def rank_by_multi_transversal(source, transversals, exclude=set(),
     Rank all vocab words by combined Plücker inner product across
     multiple transversals.
 
-    Methods:
-      - "sum_log": sum of log(|⟨T_i, L⟩| + eps)
-      - "max": max |⟨T_i, L⟩| — most conservative
-      - "mean": mean |⟨T_i, L⟩|
+    Uses batch vectorised operations: encodes all 67K vocab lines in one
+    matrix multiply, then scores all lines against all transversals with
+    a single (T×6) @ (6×N) product. ~100-1000x faster than the loop.
     """
     skip = exclude | {source}
-    eps = 1e-20
 
-    results = []
-    for word in emb.vocab:
-        if word in skip:
-            continue
-        L = emb.make_line_dual(source, word, W1, W2)
-        if L is None:
-            continue
+    # Get all target embeddings as a matrix, filtering exclusions
+    all_words, all_targets = emb.target_matrix()
+    mask = np.array([w not in skip for w in all_words])
+    words = [w for w, m in zip(all_words, mask) if m]
+    targets = all_targets[mask]  # (N, dim)
 
-        pis = [abs(plucker_inner(T, L)) for T in transversals]
+    if len(words) == 0:
+        return []
 
-        if method == "sum_log":
-            score = sum(np.log(pi + eps) for pi in pis)
-        elif method == "max":
-            score = max(pis)
-        elif method == "mean":
-            score = np.mean(pis)
-        else:
-            raise ValueError(f"Unknown method: {method}")
+    # Batch encode all lines: (N, 6)
+    src_vec = emb.src[source]
+    lines = batch_encode_lines_dual(src_vec, targets, W1, W2)
 
-        results.append((score, word))
+    # Batch score: (N,)
+    T_mat = np.stack(transversals)  # (T, 6)
+    scores = batch_score_transversals(T_mat, lines, method=method)
 
-    results.sort(key=lambda x: x[0])
-    return results
+    # Sort by score (ascending = closest to transversal)
+    order = np.argsort(scores)
+    return [(float(scores[i]), words[i]) for i in order]
 
 
 def semantic_similarity(word1, word2):

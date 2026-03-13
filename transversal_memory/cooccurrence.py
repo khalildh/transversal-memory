@@ -258,6 +258,21 @@ class SVDEmbeddings:
         b = self.tgt[target]
         return project_to_line_dual(a, b, W1, W2)
 
+    def target_matrix(self, words: Optional[list[str]] = None
+                       ) -> tuple[list[str], np.ndarray]:
+        """
+        Return target embeddings as a dense (N, dim) matrix.
+
+        words : subset of vocabulary (default: all vocab with tgt vectors).
+        Returns (word_list, matrix) where word_list[i] corresponds to row i.
+        """
+        if words is None:
+            words = [w for w in self.vocab if w in self.tgt]
+        else:
+            words = [w for w in words if w in self.tgt]
+        mat = np.stack([self.tgt[w] for w in words])
+        return words, mat
+
     def similarity(self, a: str, b: str, space: str = "source") -> float:
         """Cosine similarity between two words in source or target space."""
         vecs = self.src if space == "source" else self.tgt

@@ -215,6 +215,83 @@ def random_projection(n_items: int,
     return W
 
 
+# ── Batch operations (vectorised over vocabulary) ────────────────────────────
+
+# Hodge dual as a matrix: plucker_inner(p, q) = p @ _J6 @ q
+_J6 = np.array([
+    [0, 0, 0,  0,  0, 1],
+    [0, 0, 0,  0, -1, 0],
+    [0, 0, 0,  1,  0, 0],
+    [0, 0, 1,  0,  0, 0],
+    [0,-1, 0,  0,  0, 0],
+    [1, 0, 0,  0,  0, 0],
+], dtype=float)
+
+
+def batch_encode_lines_dual(source: np.ndarray,
+                             targets: np.ndarray,
+                             W1: np.ndarray,
+                             W2: np.ndarray) -> np.ndarray:
+    """
+    Encode all (source, target_i) pairs as Plücker lines in one shot.
+
+    source  : (d,) source embedding
+    targets : (N, d) target embeddings
+    W1, W2  : (4, 2d) projection matrices
+
+    Returns (N, 6) array of normalised Plücker lines.
+    Lines with near-zero norm are left as zeros.
+    """
+    N, d = targets.shape
+    # Build (N, 2d) concatenated vectors: [source; target_i]
+    src_tile = np.tile(source, (N, 1))  # (N, d)
+    ab = np.hstack([src_tile, targets])  # (N, 2d)
+
+    # Project to R⁴: (N, 4) each
+    P1 = ab @ W1.T  # (N, 4)
+    P2 = ab @ W2.T  # (N, 4)
+
+    # Exterior product for all 6 pairs: p_ij = P1[:,i]*P2[:,j] - P1[:,j]*P2[:,i]
+    lines = np.empty((N, 6))
+    for k, (i, j) in enumerate(_PAIRS_P3):
+        lines[:, k] = P1[:, i] * P2[:, j] - P1[:, j] * P2[:, i]
+
+    # Normalise each row
+    norms = np.linalg.norm(lines, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    lines /= norms
+
+    return lines
+
+
+def batch_score_transversals(transversals: np.ndarray,
+                              lines: np.ndarray,
+                              method: str = "sum_log") -> np.ndarray:
+    """
+    Score all lines against all transversals in one shot.
+
+    transversals : (T, 6) array of transversal lines
+    lines        : (N, 6) array of candidate lines
+    method       : "sum_log", "mean", or "max"
+
+    Returns (N,) score array (lower = closer to transversal).
+    """
+    # Plücker inner products via Hodge dual: (T, 6) @ (6, 6) @ (6, N) → (T, N)
+    # Equivalent to: for each T,L pair, T @ _J6 @ L
+    Jlines = lines @ _J6.T  # (N, 6) — Hodge-transformed lines
+    pi = np.abs(transversals @ Jlines.T)  # (T, N) — |⟨T_i, L_j⟩|
+
+    eps = 1e-20
+    if method == "sum_log":
+        return np.log(pi + eps).sum(axis=0)  # (N,)
+    elif method == "mean":
+        return pi.mean(axis=0)
+    elif method == "max":
+        return pi.max(axis=0)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+
 # ── Classic P³ transversal finder (SVD + scalar quadratic) ───────────────────
 
 def find_transversals(lines: list,

@@ -22,10 +22,14 @@ from transversal_memory.higher_grass import (
     project_to_line_dual_general,
     random_projection_dual_general,
     plucker_inner_general,
+    hodge_matrix_general,
+    batch_encode_lines_dual_general,
+    batch_score_transversals_general,
     HigherGramMemory, HigherP3Memory,
 )
 from transversal_memory.plucker import (
     project_to_line_dual, random_projection_dual, plucker_inner,
+    batch_encode_lines_dual, batch_score_transversals,
 )
 from transversal_memory import P3Memory
 
@@ -89,23 +93,21 @@ def test_single_transversal(source, targets, n_proj, rng_seed=99):
 
     T, resid = tvs[0]
 
-    # Decode: rank vocabulary by |plucker_inner_general(T, L)|
+    # Decode: rank vocabulary by |plucker_inner_general(T, L)| — batch version
     exclude = set(valid_targets[:K+1]) | {source}
-    results = []
     known = set(targets)
 
-    for word in emb.vocab:
-        if word in exclude:
-            continue
-        if word not in emb.tgt:
-            continue
-        a, b = emb.src[source], emb.tgt[word]
-        L = project_to_line_dual_general(a, b, W1, W2, n_proj)
-        if np.linalg.norm(L) > 1e-12:
-            pi = abs(plucker_inner_general(T, L, n_proj))
-            results.append((pi, word))
+    all_words = [w for w in emb.vocab if w not in exclude and w in emb.tgt]
+    tgt_mat = np.stack([emb.tgt[w] for w in all_words])  # (N, dim)
 
-    results.sort(key=lambda x: x[0])
+    lines = batch_encode_lines_dual_general(
+        emb.src[source], tgt_mat, W1, W2, n_proj)
+    J = hodge_matrix_general(n_proj)
+    scores = batch_score_transversals_general(
+        T.reshape(1, -1), lines, J, method="mean")
+
+    order = np.argsort(scores)
+    results = [(float(scores[i]), all_words[i]) for i in order]
 
     top10 = results[:10]
     top10_words = [w for _, w in top10]
@@ -174,25 +176,20 @@ def test_multi_transversal(source, targets, n_proj, n_transversals=20,
     if len(transversals) < 2:
         return None
 
-    # Decode: rank by sum_log of |plucker_inner| across transversals
+    # Decode: rank by sum_log of |plucker_inner| across transversals — batch
     exclude = set(targets) | {source}
-    eps = 1e-20
-    results = []
-    known = set(targets)
 
-    for word in emb.vocab:
-        if word in exclude or word not in emb.tgt:
-            continue
-        a, b = emb.src[source], emb.tgt[word]
-        L = project_to_line_dual_general(a, b, W1, W2, n_proj)
-        if np.linalg.norm(L) < 1e-12:
-            continue
+    all_words = [w for w in emb.vocab if w not in exclude and w in emb.tgt]
+    tgt_mat = np.stack([emb.tgt[w] for w in all_words])  # (N, dim)
 
-        pis = [abs(plucker_inner_general(T, L, n_proj)) for T in transversals]
-        score = sum(np.log(pi + eps) for pi in pis)
-        results.append((score, word))
+    lines = batch_encode_lines_dual_general(
+        emb.src[source], tgt_mat, W1, W2, n_proj)
+    J = hodge_matrix_general(n_proj)
+    T_mat = np.stack(transversals)  # (T, D)
+    scores = batch_score_transversals_general(T_mat, lines, J, method="sum_log")
 
-    results.sort(key=lambda x: x[0])
+    order = np.argsort(scores)
+    results = [(float(scores[i]), all_words[i]) for i in order]
 
     top10 = results[:10]
     top10_words = [w for _, w in top10]
