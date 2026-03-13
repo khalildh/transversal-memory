@@ -242,9 +242,40 @@ For K-tuple associations using G(2, n+1):
 - K = D - 2 lines needed to leave a 2D null space
 - G(2,4) = P³ (D=6):  triple associations (K=4)
 - G(2,5) = P⁴ (D=10): 8-tuple associations
+- G(2,6) = P⁵ (D=15): 13-tuple associations
 - G(2,10) = P⁹ (D=45): 43-tuple associations
 
 Higher Grassmannians bind more items per association, not more triples.
+
+### Higher Grassmannians: G(2,6) vs G(2,4)
+
+The 6D Plücker space of G(2,4) is a bottleneck for large vocabularies —
+too few dimensions to discriminate 67K candidates. Moving to G(2,6)
+with 15D Plücker space dramatically improves generation quality:
+
+| Grassmannian | D  | Lines/query | Mean similarity | Example (music) |
+|--------------|----|-------------|:---------------:|-----------------|
+| G(2,4) = P³  |  6 | 5           | 0.284           | orleans, empresses, seafloor |
+| G(2,6) = P⁵  | 15 | 14          | **0.733**       | strumming, joplin, saxophone, plectrum |
+
+Full results across 8 concepts with 10 multi-transversals:
+
+```
+G(2,6) generation:
+  music:    strumming, joplin, chordophone, saxophone, plectrum
+  guitar:   piano, organist, warbling, ditty, legato
+  king:     courtiers, sovereigns, empresses, empress, democracies
+  doctor:   outpatient, veterinary, immunotherapy, hemorrhoids
+  fire:     brightness, brimstone, cremate, embers
+  ocean:    seaside, tides, barnacle, seagulls
+```
+
+The trade-off: G(2,6) needs 14 lines per query (vs 5 for G(2,4)) and takes
+~50s per word (vs ~3s). But 15D provides enough geometric room to discriminate
+67K items with fewer multi-transversal samples needed.
+
+G(2,5) performs worse than G(2,4) — likely a Hodge dual formulation issue
+in 10D. This is an open problem.
 
 ---
 
@@ -336,7 +367,9 @@ transversal_memory/
 │   ├── solver.py        # Exact Plücker solver via PCA + quadratic formula
 │   ├── memory.py        # P3Memory, GramMemory, ProjectedMemory
 │   ├── embeddings.py    # Word vector utilities (GloVe, random, make_line)
-│   └── cooccurrence.py  # PPMI + sparse SVD embedding pipeline
+│   ├── cooccurrence.py  # PPMI + sparse SVD embedding pipeline
+│   ├── cas.py           # Content-addressable store via Plücker geometry
+│   └── higher_grass.py  # Generalized G(2, n+1) for n > 3
 ├── examples/
 │   ├── basic_geometry.py      # Pure geometry: 4 lines → 2 transversals
 │   ├── capital_cities.py      # Analogy: Paris:France :: Madrid:Spain
@@ -347,7 +380,9 @@ transversal_memory/
 │   ├── fix_generative.py      # Fix experiments (dual projection)
 │   ├── sequential_prediction.py    # Sequence prediction experiments
 │   ├── associative_generation.py   # Single-transversal generation (baseline)
-│   └── multi_transversal_generation.py  # Multi-transversal generation (works)
+│   ├── multi_transversal_generation.py  # Multi-transversal generation (works)
+│   ├── cas_demo.py                     # Content-addressable store demo
+│   └── higher_grassmannian_demo.py     # G(2,4) vs G(2,5) vs G(2,6) comparison
 ├── COPUNCTAL_FIX.md           # Detailed writeup of the failure and fix
 ├── tests/
 │   └── test_plucker.py
