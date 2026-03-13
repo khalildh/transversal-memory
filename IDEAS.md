@@ -64,6 +64,14 @@
   quartic. But the embedding covariance (used in Mahalanobis/whitened cosine)
   already captures the 2nd-order structure, which strictly dominates.
 
+- **Can an optimized Gram^0.05 multi-seed ensemble add to the RRF?** No.
+  A background agent independently optimized the pure-geometry approach to
+  p@10=0.1065 (9.7x over original 0.011) using 200 random projection seeds
+  with Gram^0.05 eigenvalue compression. Despite this dramatic standalone
+  improvement, adding it as a 9th signal degrades to 0.1270 (from 0.1280),
+  and replacing cos_src degrades to 0.1235. The information captured by
+  the Gram ensemble is entirely subsumed by embedding-space covariance signals.
+
 - **Does signal pruning help?** Yes — significantly. Removing cosine-to-centroid
   (redundant with Mahalanobis-to-centroid) and top-3-mean (redundant with
   max+mean) improved p@10 from 0.123 to 0.127. Fewer signals = less dilution
