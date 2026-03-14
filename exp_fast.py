@@ -94,6 +94,7 @@ class OnlineMemoryAttention(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.scale = self.d_head ** -0.5
+        self.decay = decay
 
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.W1_write = nn.Linear(d_model, 4 * n_heads, bias=False)
@@ -135,7 +136,21 @@ class OnlineMemoryAttention(nn.Module):
         incidence_sq = incidence ** 2
         causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
         incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        # Apply temporal weighting: λ^(t-s) for each (t, s) pair
+        # When λ > 1 this amplifies older memories; when λ < 1 it decays them
+        if self.decay != 1.0:
+            positions = torch.arange(T, device=x.device, dtype=x.dtype)
+            # weights[t, s] = λ^(t-s), shape (T, T)
+            weights = self.decay ** (positions.unsqueeze(1) - positions.unsqueeze(0))
+            weights = weights.tril(diagonal=-1)  # causal: only s < t
+            incidence_sq = incidence_sq * weights.unsqueeze(0).unsqueeze(0)
+
         mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
+
+        # Normalize per-position to prevent unbounded growth when λ > 1
+        if self.decay > 1.0:
+            mem_score = mem_score / (mem_score.amax(dim=-1, keepdim=True).clamp(min=1e-8))
 
         mem_val = self.mem_value(x)
         gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
@@ -456,6 +471,7 @@ def main():
     parser.add_argument("--baseline", action="store_true", help="Also train standard baseline")
     parser.add_argument("--epochs", type=int, default=None, help="Override epoch count")
     parser.add_argument("--decay", type=float, default=0.99, help="Memory decay rate")
+    parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -466,6 +482,11 @@ def main():
         cfg.d_model = 128
         cfg.n_heads = 4
         print("  FAST MODE: 2 layers, d=128, 4 heads")
+
+    if args.seq_len:
+        cfg.seq_len = args.seq_len
+        if args.seq_len >= 256:
+            cfg.batch_size = 64  # reduce batch for longer seqs
 
     if args.epochs:
         cfg.n_epochs = args.epochs

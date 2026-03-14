@@ -87,14 +87,60 @@ Sweep on fast 2-layer model (7 epochs each):
 hyperparameter. The model benefits from geometric structure regardless of
 forgetting rate. λ=0.95 is marginally best but all values work.
 
-#### 3d. Multi-scale memory
+Longer sequence results (seq=256, fast 2-layer):
+
+| Config | PPL | vs Standard (511.9) |
+|--------|-----|---------------------|
+| λ=0.95 | 513.3 | +0.3% (worse!) |
+| λ=0.99 | 507.6 | -0.8% |
+
+The memory advantage shrank from 3.5% at seq=128 to <1% at seq=256. The 6D
+Gram matrix (rank 6, 21 independent entries) likely saturates when
+compressing 200+ tokens of relational structure. This motivates both higher-
+dimensional Plücker spaces (idea 4) and amplifying memory (3d-ii below).
+
+#### 3d. Amplifying memory (λ > 1) with normalization
+
+**Motivation**: The seq=256 results showed the memory advantage disappearing,
+and the decay sweep showed λ doesn't matter much in [0.95, 1.0]. The natural
+question: what happens *above* 1.0? If λ < 1 forgets old patterns and λ = 1
+weights all patterns equally, then λ > 1 should *amplify* established
+patterns — the more a relational direction has been reinforced, the stronger
+it becomes.
+
+This reframes the Gram matrix from "running average of relational structure"
+to "reinforcement signal for persistent patterns." The topic of a document
+*is* the relational structure that persists — recent tokens are noise until
+they reinforce the pattern. λ > 1 says "trust what's been confirmed."
+
+**Implementation**: Applied as temporal weights on the incidence matrix
+(no loop needed): score_t = Σ_{s<t} λ^(t-s) · incidence(t,s)², with
+max-normalization per position when λ > 1 to prevent unbounded scores.
+
+**Status: tested, λ=1.05 hurts at both seq lengths**
+
+| λ | PPL (seq=128) | vs Std (503.4) | PPL (seq=256) | vs Std (511.9) |
+|---|---------------|----------------|---------------|----------------|
+| 0.95 | **486.0** | **-3.5%** | 513.3 | +0.3% |
+| 0.99 | 486.8 | -3.3% | **507.6** | **-0.8%** |
+| 1.0 | 486.6 | -3.3% | — | — |
+| 1.05 | 496.8 | -1.3% | 513.3 | +0.3% |
+
+**Lesson**: Amplification doesn't help. λ=0.95 and λ=1.05 fail at seq=256
+for opposite reasons — fast forgetting loses long-range structure, while
+amplification over-weights old patterns and normalization washes out the
+signal. λ=0.99 (half-life ≈ 69 tokens) is the sweet spot, but the advantage
+still shrinks from 3.3% → 0.8% going 128 → 256 tokens. The real bottleneck
+is the 6D Gram space saturating, not the temporal weighting.
+
+#### 3e. Multi-scale memory
 
 Run two parallel Gram memories with different decay rates: fast (λ=0.95,
 sentence-level) and slow (λ=0.999, document-level). Different heads could
 read from different timescales. This lets the model capture both local
 syntactic patterns and global topic structure.
 
-#### 3e. Gram eigenstructure as features
+#### 3f. Gram eigenstructure as features
 
 Instead of scoring read lines against the full Gram matrix, extract the
 top-k eigenvectors of M_t and use them as additional "memory keys" that
@@ -103,7 +149,7 @@ axes directly to the attention mechanism.
 
 More complex to implement (differentiable eigendecomposition needed).
 
-#### 3f. Dual-pathway incidence attention ← TESTED, negative
+#### 3g. Dual-pathway incidence attention ← TESTED, negative
 
 **Status: tested, PPL 372 from scratch (1.8x worse than standard)**
 
