@@ -197,15 +197,17 @@ class OnlineMemoryAttention(nn.Module):
     forward pass.
 
     As tokens are processed, consecutive pairs are encoded as Plücker lines
-    and accumulated into a running Gram matrix M = Σ pᵢ⊗pᵢ. The current
-    token's query line is scored against this accumulated memory.
+    and accumulated into a running Gram matrix. The current token's query
+    line is scored against this accumulated memory.
 
-    This creates a differentiable, growing memory that captures the relational
-    structure of the sequence so far. The Gram eigenvectors become "principal
-    relational axes" — the model discovers what the text is *about* as it reads.
+    Memory-efficient implementation: instead of materializing (B,T,H,6,6)
+    Gram matrices at every position, we compute the Plücker incidence
+    between read lines and all past write lines using causal masking on
+    the (T,T) incidence matrix — same memory footprint as standard attention.
 
-    Key design: the memory write happens causally (only past tokens contribute),
-    so this is compatible with autoregressive generation.
+    The score at position t is: Σ_{s<t} (read_t · J6 · write_s)²
+    This is equivalent to read_t @ J6 @ M_t @ J6.T @ read_t where
+    M_t = Σ_{s<t} write_s ⊗ write_s, but computed without building M.
     """
     def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99):
         super().__init__()
@@ -247,12 +249,9 @@ class OnlineMemoryAttention(nn.Module):
         std_attn = self.drop(F.softmax(std_attn, dim=-1))
         seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
 
-        # === Online memory accumulation ===
-        # Write: encode consecutive token pairs as Plücker lines
-        # Use [x_t, x_{t-1}] pairs (bigram-style, proven effective in v3)
+        # === Online memory via Plücker incidence ===
+        # Write lines from bigrams [x_{t-1}, x_t]
         x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
-
-        # Write lines from bigrams
         w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
         w2 = self.W2_write(x).reshape(B, T, H, 4)
         write_lines = exterior(w1, w2)  # (B, T, H, 6)
@@ -262,49 +261,36 @@ class OnlineMemoryAttention(nn.Module):
         r2 = self.W2_read(x).reshape(B, T, H, 4)
         read_lines = exterior(r1, r2)  # (B, T, H, 6)
 
-        # Accumulate Gram matrices causally using cumulative sum
-        # outer products: (B, T, H, 6, 1) @ (B, T, H, 1, 6) = (B, T, H, 6, 6)
-        outer = write_lines.unsqueeze(-1) * write_lines.unsqueeze(-2)  # (B, T, H, 6, 6)
-
-        # Causal accumulation with exponential decay
-        # M_t = decay * M_{t-1} + outer_t
-        # This is equivalent to: M_t = Σ_{s≤t} decay^{t-s} * outer_s
-        # We compute this efficiently using a weighted cumsum
-        if self.decay < 1.0:
-            # Apply decay weights: weight[t] = decay^(T-1-t) for position t
-            # Then cumsum gives the decayed accumulation
-            powers = torch.arange(T, device=x.device, dtype=x.dtype)
-            # For position t, we want: M_t = Σ_{s=0}^{t} decay^{t-s} * outer_s
-            # = Σ_{s=0}^{t} decay^{t-s} * outer_s
-            # We scale outer_s by decay^{-s}, cumsum, then scale result by decay^t
-            inv_decay_weights = (self.decay ** (-powers)).reshape(1, T, 1, 1, 1)
-            decay_weights = (self.decay ** powers).reshape(1, T, 1, 1, 1)
-            scaled_outer = outer * inv_decay_weights
-            cum_gram = torch.cumsum(scaled_outer, dim=1) * decay_weights
-        else:
-            cum_gram = torch.cumsum(outer, dim=1)  # (B, T, H, 6, 6)
-
-        # Shift by 1 so position t only sees memory from positions 0..t-1 (causal)
-        cum_gram = torch.cat([
-            torch.zeros(B, 1, H, 6, 6, device=x.device),
-            cum_gram[:, :-1]
-        ], dim=1)
-
-        # Score read lines against accumulated Gram: p @ J @ M @ J^T @ p
+        # Compute Plücker incidence matrix: (B, H, T_read, T_write)
+        # incidence[t,s] = read_t · J6 · write_s
         J = self.J6
-        J_read = torch.einsum('bthi,ij->bthj', read_lines, J)  # (B, T, H, 6)
-        # (B, T, H, 6) @ (B, T, H, 6, 6) -> (B, T, H, 6) then dot with J_read
-        mem_scored = torch.einsum('bthi,bthij->bthj', J_read, cum_gram)  # (B, T, H, 6)
-        mem_score = (mem_scored * J_read).sum(dim=-1)  # (B, T, H)
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)  # (B, T, H, 6)
+        # Reshape for batched matmul: (B, H, T, 6)
+        read_h = read_lines.permute(0, 2, 1, 3)    # (B, H, T, 6)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)     # (B, H, T, 6)
 
-        # Memory value: weighted by score
+        # Incidence matrix: (B, H, T, T) — same shape as standard attention
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)  # (B, H, T, T)
+
+        # Square it — Gram energy is sum of squared incidences
+        incidence_sq = incidence ** 2
+
+        # Causal mask: position t only sees s < t (strictly causal)
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        # Memory score per position: sum of squared incidences with past
+        mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
+
+        # Memory value: gated by score
         mem_val = self.mem_value(x)  # (B, T, D)
         gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
-        scale = self.mem_scale.reshape(1, 1, H)
-        gated_score = torch.sigmoid(mem_score * scale) * gate  # (B, T, H)
-        gated_score = gated_score.mean(dim=-1, keepdim=True)  # (B, T, 1)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)  # (B, T, H)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate  # (B, T, H)
+        gated = gated.mean(dim=-1, keepdim=True)  # (B, T, 1)
 
-        combined = seq_out + gated_score * mem_val
+        combined = seq_out + gated * mem_val
 
         return self.out(combined)
 
