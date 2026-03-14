@@ -29,8 +29,10 @@ uv run python exp_lm_variants.py kernel|bigram|hybrid|all
 - `exp_lm.py` — original Plücker attention LM (broken, PPL 2063)
 - `exp_lm_variants.py` — three fixes: kernel (252), bigram (215), hybrid (207)
 - `exp_lm_v2.py`, `exp_lm_v3.py`, `exp_lm_v4.py` — standalone variant scripts
-- `ideas.md` — active ideas and resolved questions
-- `data/cache/` — pickled PPMI+SVD embeddings (auto-built)
+- `exp_mem_attn.py` — memory-augmented attention (static + online Gram memory)
+- `exp_fast.py` — fast iteration harness (cached data, checkpoint init, early stopping)
+- `ideas.md` — active ideas, experiment results, and resolved questions
+- `data/cache/` — pickled PPMI+SVD embeddings + cached token tensors (auto-built)
 - `data/wikitext/` — WikiText-2 parquet files (gitignored)
 - `checkpoints/` — saved model weights (gitignored)
 
@@ -54,14 +56,30 @@ uv run python exp_lm_variants.py kernel|bigram|hybrid|all
 - Signals: cos_src, cos_tgt, max_sim, mean_sim, recip_NN, Mahalanobis_cent, whitened_cos, Mahalanobis_src
 - Mahalanobis-to-centroid is the strongest single signal
 
+### Online Gram memory (exp_mem_attn.py) ← current best
+- Standard Q·K attention + causal Gram accumulation as scalar gate
+- M_t = Σ_{s<t} decay^{t-s} · p_s⊗p_s (6×6 relational summary)
+- PPL 206 vs standard 209 — first geometry win
+- Memory-efficient: computes (B,H,T,T) incidence matrix, not (B,T,H,6,6) Grams
+- Geometry should AUGMENT attention (scalar gate), not COMPETE (dual pathway fails)
+
 ### Key results
 - Word association: p@10=0.128 (73% over cosine baseline)
 - Plücker geometry adds zero to embedding ensemble for discriminative ranking
 - Geometry beats embeddings at K≥10 seed associates (few-shot regime)
+- Online Gram memory: PPL 206 vs standard 209 (first geometry win in LM)
 - Hybrid attention ties standard (PPL 207 vs 208)
+- Dual-pathway incidence attention: PPL 372 (fails — geometry can't replace Q·K routing)
+
+### Fast iteration (exp_fast.py)
+- Cached tokenized data, no baseline re-training, batch_size=128, cosine LR
+- Checkpoint init from standard model + 3 epoch fine-tune (~5 min per experiment)
+- `--fast` flag for 2-layer screening model (~1 min per experiment)
+- Early stopping with patience=2
 
 ## Conventions
 
+- **Always update `ideas.md` after testing an idea** — record result, mark status, note lessons learned. This is the project's experimental log.
 - Checkpoints: `checkpoints/lm_<variant>.pt` with dict keys: model, type, losses, ppls, vocab
 - Config class for LM hyperparameters (d_model=192, n_heads=6, n_layers=4, seq_len=128)
 - Tokenizer: tiktoken gpt2 encoding

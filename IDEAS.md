@@ -27,24 +27,101 @@ tokens. The transformer processes them alongside the input.
 Simpler than option 1 — doesn't require modifying the attention mechanism at all.
 Just uses memory as a retrieval augmentation step before inference.
 
-### 3. Online memory accumulation ★ most interesting
+### 3. Online memory accumulation ★ WORKING — first geometry win
+
+**Status: implemented, PPL 206 vs standard 209**
 
 As the model processes text, it accumulates Plücker lines into Gram matrices
 (the `M = Σ pᵢ⊗pᵢ` operation) in real time. Later tokens can query these
 accumulated memories. Similar to Neural Turing Machines or modern Hopfield
 networks, but using geometric incidence instead of dot-product addressing.
 
-**Why this is the most interesting**: It creates a differentiable, growing
-memory that captures relational structure (not just content) and can be queried
-geometrically. The Gram matrix eigenvectors become "principal relational axes"
-that emerge during processing — the model discovers what the text is *about*
-as it reads.
+**Why it works**: 36 numbers (6×6 Gram) compress the relational structure of
+the entire past sequence. Standard attention has no way to compute this — it
+sees individual tokens, not structural summaries. The Gram eigenvectors are
+emergent "principal relational axes" of the text.
 
-Key design questions:
-- Write head: which token pairs get stored as Plücker lines?
-- Read head: how does the current token query the accumulated Gram matrix?
-- Forgetting: does M grow forever, or is there a decay/gating mechanism?
-- Multi-scale: separate fast (sentence) and slow (document) Gram memories?
+Implementation: `exp_mem_attn.py`, OnlineMemoryAttention class. Memory-efficient
+version computes (B,H,T,T) Plücker incidence matrix (same footprint as standard
+attention) rather than materializing (B,T,H,6,6) Gram matrices.
+
+#### 3a. Dual-pathway incidence attention ← easiest to test
+
+Instead of collapsing the (B,H,T,T) Plücker incidence matrix to a scalar via
+sum-of-squares, use it as a **second attention pathway**. Softmax over the
+incidence matrix and use it to route values, just like standard attention does.
+Two parallel pathways: Q·K dot-product attention + Plücker incidence attention,
+each producing weighted sums of values, combined with a learned gate.
+
+This is the simplest change — the incidence matrix is already computed, we just
+need to softmax it and multiply by values instead of squaring and summing.
+
+**Why this should help**: Currently the geometry produces a scalar "how related
+is my query to the past?" but throws away *which* past tokens are geometrically
+related. The attention pathway preserves this information.
+
+#### 3b. Longer sequences (512, 1024)
+
+At seq_len=128, standard attention can see everything — the compressed Gram
+summary isn't needed. At 512+, the Gram memory becomes more valuable because
+it summarizes structure beyond the attention window. The 3 PPL improvement at
+128 should grow at longer sequences where standard attention is more strained.
+
+Easy to test: just change Config.seq_len. May need to reduce batch_size to
+fit in memory.
+
+#### 3c. Tune decay parameter ← TESTED, decay doesn't matter
+
+**Status: tested, all decay values beat standard by ~3.3-3.5%**
+
+Sweep on fast 2-layer model (7 epochs each):
+
+| Decay (λ) | Best PPL | vs Standard (503.4) |
+|-----------|----------|---------------------|
+| 0.95      | **486.0** | -3.5% (best)       |
+| 0.99      | 486.8    | -3.3%               |
+| 1.0       | 486.6    | -3.3%               |
+| 0.995     | 490.4    | -2.6%               |
+
+**Lesson**: The Gram memory mechanism is robust — decay is not a critical
+hyperparameter. The model benefits from geometric structure regardless of
+forgetting rate. λ=0.95 is marginally best but all values work.
+
+#### 3d. Multi-scale memory
+
+Run two parallel Gram memories with different decay rates: fast (λ=0.95,
+sentence-level) and slow (λ=0.999, document-level). Different heads could
+read from different timescales. This lets the model capture both local
+syntactic patterns and global topic structure.
+
+#### 3e. Gram eigenstructure as features
+
+Instead of scoring read lines against the full Gram matrix, extract the
+top-k eigenvectors of M_t and use them as additional "memory keys" that
+the standard attention can attend to. This exposes the principal relational
+axes directly to the attention mechanism.
+
+More complex to implement (differentiable eigendecomposition needed).
+
+#### 3f. Dual-pathway incidence attention ← TESTED, negative
+
+**Status: tested, PPL 372 from scratch (1.8x worse than standard)**
+
+Used the (B,H,T,T) Plücker incidence matrix as a second attention pathway
+alongside standard Q·K. Each pathway softmaxes its logits and routes values
+independently, combined with a learned gate: `(1-g)*std_out + g*geo_out`.
+
+Results: from scratch PPL 372 vs standard ~206 (1.8x worse). From checkpoint
+init PPL 209 (matches baseline but geometry isn't helping — the gate likely
+learns to suppress the geometric pathway).
+
+**Why it failed**: When geometry competes with standard attention for value
+routing, it loses. Standard Q·K is a much better attention pattern for LM.
+The successful approach (online memory scalar gate) works because it ADDS
+geometric information on top of standard attention rather than replacing any
+part of the attention computation.
+
+**Lesson**: Geometry should augment, not compete. Scalar gating > dual pathway.
 
 ### 4. Higher Grassmannian attention
 

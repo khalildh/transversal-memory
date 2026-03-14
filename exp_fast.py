@@ -1,0 +1,506 @@
+"""
+exp_fast.py — Fast iteration harness for Plücker attention experiments
+
+Speed optimizations:
+  - Cached tokenized data (load once, reuse)
+  - No baseline re-training (known: PPL ~206-209)
+  - batch_size=128 (sweet spot for MPS throughput)
+  - 7 epochs default (convergence plateau)
+  - Early stopping (patience=2, min_delta=1.0 PPL)
+  - Init from standard checkpoint (fine-tune 3 epochs)
+  - Cosine LR schedule with warmup
+
+Usage:
+  python exp_fast.py dual_path              # dual-pathway incidence attention
+  python exp_fast.py online_mem             # current best (scalar gate)
+  python exp_fast.py dual_path --from-scratch  # train from scratch (no checkpoint init)
+  python exp_fast.py dual_path --fast       # 2-layer screening model (~1 min)
+  python exp_fast.py dual_path --baseline   # also train standard baseline
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import tiktoken
+import pyarrow.parquet as pq
+import time
+import math
+import sys
+import argparse
+from pathlib import Path
+from itertools import combinations
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+class Config:
+    d_model = 192
+    n_heads = 6
+    n_layers = 4
+    dropout = 0.1
+    seq_len = 128
+    batch_size = 128
+    n_epochs = 7
+    lr = 3e-4
+    grad_clip = 1.0
+    warmup_steps = 50
+    patience = 2         # early stopping patience (epochs)
+    min_delta = 1.0      # min PPL improvement to count
+    data_dir = Path("data/wikitext")
+    cache_dir = Path("data/cache")
+
+# ── Plücker primitives ──────────────────────────────────────────────────────
+
+_PAIRS = list(combinations(range(4), 2))
+
+_J6 = torch.tensor([
+    [0,0,0,0,0,1],[0,0,0,0,-1,0],[0,0,0,1,0,0],
+    [0,0,1,0,0,0],[0,-1,0,0,0,0],[1,0,0,0,0,0],
+], dtype=torch.float32)
+
+def exterior(p1, p2):
+    parts = [p1[...,i]*p2[...,j] - p1[...,j]*p2[...,i] for i,j in _PAIRS]
+    L = torch.stack(parts, dim=-1)
+    return L / L.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+
+# ── Attention variants ──────────────────────────────────────────────────────
+
+class StandardAttention(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        attn = attn.masked_fill(mask, float('-inf'))
+        attn = self.drop(F.softmax(attn, dim=-1))
+        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        return self.out(out)
+
+
+class OnlineMemoryAttention(nn.Module):
+    """Current best: scalar Gram energy gate."""
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        self.register_buffer('J6', _J6)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
+        w2 = self.W2_write(x).reshape(B, T, H, 4)
+        write_lines = exterior(w1, w2)
+        r1 = self.W1_read(x).reshape(B, T, H, 4)
+        r2 = self.W2_read(x).reshape(B, T, H, 4)
+        read_lines = exterior(r1, r2)
+
+        J = self.J6
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+        mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
+class DualPathAttention(nn.Module):
+    """
+    Dual-pathway: standard Q·K attention + Plücker incidence attention.
+
+    Both pathways produce (B, H, T, T) attention matrices that get softmaxed
+    and used to route values. The two outputs are combined with a learned gate.
+
+    This lets the geometry actually ROUTE INFORMATION between tokens rather
+    than just producing a scalar score.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+
+        # Standard pathway: Q, K, V
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+
+        # Geometric pathway: write lines (bigram), read lines, separate values
+        self.W1_write = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.geo_value = nn.Linear(d_model, d_model)
+
+        # Per-head gate: how much geometric vs standard
+        self.path_gate = nn.Linear(d_model, n_heads)
+        # Scale for incidence logits
+        self.incidence_scale = nn.Parameter(torch.full((n_heads,), 1.0))
+
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        self.register_buffer('J6', _J6)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        # === Standard pathway ===
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_logits = (q @ k.transpose(-1, -2)) * self.scale  # (B, H, T, T)
+
+        # === Geometric pathway ===
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
+        w2 = self.W2_write(x).reshape(B, T, H, 4)
+        write_lines = exterior(w1, w2)  # (B, T, H, 6)
+
+        r1 = self.W1_read(x).reshape(B, T, H, 4)
+        r2 = self.W2_read(x).reshape(B, T, H, 4)
+        read_lines = exterior(r1, r2)  # (B, T, H, 6)
+
+        J = self.J6
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)     # (B, H, T, 6)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)      # (B, H, T, 6)
+
+        # Plücker incidence as attention logits
+        geo_logits = read_h @ Jwrite_h.transpose(-1, -2)  # (B, H, T, T)
+        scale = self.incidence_scale.reshape(1, H, 1, 1)
+        geo_logits = geo_logits * scale
+
+        # Causal mask (shared)
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+
+        # Standard attention → standard values
+        std_attn = self.drop(F.softmax(std_logits.masked_fill(mask, float('-inf')), dim=-1))
+        std_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)  # (B, T, D)
+
+        # Geometric attention → geometric values
+        geo_attn = self.drop(F.softmax(geo_logits.masked_fill(mask, float('-inf')), dim=-1))
+        geo_v = self.geo_value(x).reshape(B, T, H, dh).permute(0, 2, 1, 3)  # (B, H, T, dh)
+        geo_out = (geo_attn @ geo_v).transpose(1, 2).reshape(B, T, D)  # (B, T, D)
+
+        # Per-head gate: interpolate between standard and geometric
+        gate = torch.sigmoid(self.path_gate(x))  # (B, T, H)
+        gate = gate.mean(dim=-1, keepdim=True)    # (B, T, 1)
+
+        combined = (1 - gate) * std_out + gate * geo_out
+
+        return self.out(combined)
+
+# ── Model ────────────────────────────────────────────────────────────────────
+
+ATTN_CLASSES = {
+    "standard": StandardAttention,
+    "online_mem": OnlineMemoryAttention,
+    "dual_path": DualPathAttention,
+}
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, attn_type, dropout=0.1, **kw):
+        super().__init__()
+        self.attn = ATTN_CLASSES[attn_type](d_model, n_heads, dropout=dropout, **kw)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model), nn.GELU(),
+            nn.Linear(4 * d_model, d_model), nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+class LM(nn.Module):
+    def __init__(self, vocab_size, cfg, attn_type, **kw):
+        super().__init__()
+        self.cfg = cfg
+        self.attn_type = attn_type
+        self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.seq_len, cfg.d_model)
+        self.blocks = nn.ModuleList([
+            Block(cfg.d_model, cfg.n_heads, attn_type, cfg.dropout, **kw)
+            for _ in range(cfg.n_layers)
+        ])
+        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight
+        self.apply(self._init)
+
+    def _init(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None: nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, idx):
+        B, T = idx.shape
+        x = self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device))
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.ln_f(x))
+
+    def count_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+# ── Data (cached) ────────────────────────────────────────────────────────────
+
+_token_cache = {}
+
+def load_tokens_cached(split, cfg):
+    if split in _token_cache:
+        return _token_cache[split]
+    cache_file = cfg.cache_dir / f"wikitext_{split}_tokens.pt"
+    if cache_file.exists():
+        tokens = torch.load(cache_file, weights_only=True)
+    else:
+        enc = tiktoken.get_encoding("gpt2")
+        fname = {"train": "train.parquet", "val": "val.parquet", "test": "test.parquet"}
+        table = pq.read_table(cfg.data_dir / fname[split])
+        text = "\n".join(t for t in table['text'].to_pylist() if t.strip())
+        tokens = torch.tensor(enc.encode(text, allowed_special=set()), dtype=torch.long)
+        cfg.cache_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(tokens, cache_file)
+        print(f"  Cached {split} tokens: {len(tokens):,} → {cache_file}")
+    _token_cache[split] = tokens
+    return tokens
+
+def make_batches(data, seq_len, batch_size):
+    n = len(data) - 1
+    n_seqs = (n // seq_len // batch_size) * batch_size
+    data = data[:n_seqs * seq_len + 1]
+    x = data[:-1].reshape(n_seqs, seq_len)
+    y = data[1:].reshape(n_seqs, seq_len)
+    perm = torch.randperm(n_seqs)
+    return [(x[perm[i:i+batch_size]], y[perm[i:i+batch_size]])
+            for i in range(0, n_seqs, batch_size)
+            if i + batch_size <= n_seqs]
+
+# ── Checkpoint init ──────────────────────────────────────────────────────────
+
+def load_standard_checkpoint(model, device):
+    """Load standard checkpoint and transfer shared weights."""
+    ckpt_path = Path("checkpoints/lm_standard.pt")
+    if not ckpt_path.exists():
+        print("  No standard checkpoint found, training from scratch")
+        return False
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    std_state = ckpt["model"]
+    model_state = model.state_dict()
+
+    loaded = 0
+    for key in std_state:
+        if key in model_state and std_state[key].shape == model_state[key].shape:
+            model_state[key] = std_state[key]
+            loaded += 1
+
+    model.load_state_dict(model_state)
+    total = len(model_state)
+    print(f"  Loaded {loaded}/{total} params from standard checkpoint")
+    return True
+
+# ── Training ─────────────────────────────────────────────────────────────────
+
+def get_lr(step, cfg, total_steps):
+    """Cosine schedule with linear warmup."""
+    if step < cfg.warmup_steps:
+        return cfg.lr * step / cfg.warmup_steps
+    progress = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
+    return cfg.lr * 0.5 * (1 + math.cos(math.pi * progress))
+
+def train(attn_type, cfg, device, from_checkpoint=True, **kw):
+    enc = tiktoken.get_encoding("gpt2")
+    train_data = load_tokens_cached("train", cfg)
+    val_data = load_tokens_cached("val", cfg)
+
+    model = LM(enc.n_vocab, cfg, attn_type, **kw).to(device)
+    print(f"\n  {attn_type}: {model.count_params():,} params")
+
+    if from_checkpoint and attn_type != "standard":
+        loaded = load_standard_checkpoint(model, device)
+        if loaded:
+            cfg = Config()  # reset to avoid mutating
+            cfg.n_epochs = 3  # fine-tune only
+            cfg.lr = 1e-4    # lower LR for fine-tuning
+            print(f"  Fine-tuning for {cfg.n_epochs} epochs (lr={cfg.lr})")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.01)
+    n_batches = len(make_batches(train_data, cfg.seq_len, cfg.batch_size))
+    total_steps = n_batches * cfg.n_epochs
+
+    losses, ppls = [], []
+    best_ppl = float('inf')
+    patience_counter = 0
+    global_step = 0
+
+    for ep in range(cfg.n_epochs):
+        t0 = time.time()
+        model.train()
+        batches = make_batches(train_data, cfg.seq_len, cfg.batch_size)
+        ep_loss = 0.0
+        for xb, yb in batches:
+            lr = get_lr(global_step, cfg, total_steps)
+            for pg in opt.param_groups:
+                pg['lr'] = lr
+
+            xb, yb = xb.to(device), yb.to(device)
+            loss = F.cross_entropy(model(xb).view(-1, enc.n_vocab), yb.view(-1))
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            opt.step(); ep_loss += loss.item()
+            global_step += 1
+        avg = ep_loss / len(batches); losses.append(avg)
+
+        model.eval()
+        with torch.no_grad():
+            vb = make_batches(val_data, cfg.seq_len, cfg.batch_size)
+            vl = sum(F.cross_entropy(model(x.to(device)).view(-1, enc.n_vocab),
+                     y.to(device).view(-1)).item() for x, y in vb) / len(vb)
+        ppl = math.exp(min(vl, 20)); ppls.append(ppl)
+
+        elapsed = time.time() - t0
+        improved = "★" if ppl < best_ppl - cfg.min_delta else ""
+        print(f"    ep {ep+1:2d}: loss={avg:.3f}  ppl={ppl:.1f}  ({elapsed:.1f}s) {improved}")
+
+        if ppl < best_ppl - cfg.min_delta:
+            best_ppl = ppl
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= cfg.patience:
+                print(f"    Early stopping (no improvement for {cfg.patience} epochs)")
+                break
+
+    # Save
+    Path("checkpoints").mkdir(exist_ok=True)
+    torch.save({"model": model.state_dict(), "type": attn_type,
+                "losses": losses, "ppls": ppls, "vocab": enc.n_vocab},
+               f"checkpoints/lm_{attn_type}.pt")
+    return model, losses, ppls
+
+# ── Generation ───────────────────────────────────────────────────────────────
+
+def generate(model, enc, prompt, max_tok=60, temp=0.8, top_k=40):
+    model.eval()
+    dev = next(model.parameters()).device
+    idx = torch.tensor([enc.encode(prompt, allowed_special=set())[-model.cfg.seq_len:]],
+                       dtype=torch.long, device=dev)
+    with torch.no_grad():
+        for _ in range(max_tok):
+            logits = model(idx[:, -model.cfg.seq_len:])[:, -1] / temp
+            if top_k:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = float('-inf')
+            idx = torch.cat([idx, torch.multinomial(F.softmax(logits, -1), 1)], 1)
+    return enc.decode(idx[0].tolist())
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+PROMPTS = [
+    "The president of the United States",
+    "In the year 1945 ,",
+    "The cat sat on the",
+]
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("variant", choices=list(ATTN_CLASSES.keys()), nargs="?", default="dual_path")
+    parser.add_argument("--from-scratch", action="store_true", help="Train from scratch (no checkpoint)")
+    parser.add_argument("--fast", action="store_true", help="2-layer screening model")
+    parser.add_argument("--baseline", action="store_true", help="Also train standard baseline")
+    parser.add_argument("--epochs", type=int, default=None, help="Override epoch count")
+    parser.add_argument("--decay", type=float, default=0.99, help="Memory decay rate")
+    args = parser.parse_args()
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    cfg = Config()
+
+    if args.fast:
+        cfg.n_layers = 2
+        cfg.d_model = 128
+        cfg.n_heads = 4
+        print("  FAST MODE: 2 layers, d=128, 4 heads")
+
+    if args.epochs:
+        cfg.n_epochs = args.epochs
+
+    kw = {"decay": args.decay}
+
+    print(f"{'='*60}")
+    print(f"  {args.variant} | bs={cfg.batch_size} seq={cfg.seq_len} layers={cfg.n_layers}")
+    print(f"  from_checkpoint={not args.from_scratch}")
+    print(f"{'='*60}")
+
+    # Train baseline if requested
+    if args.baseline:
+        print("\n  Training standard baseline...")
+        std, _, std_p = train("standard", cfg, device, from_checkpoint=False)
+        print(f"  Standard baseline: PPL {min(std_p):.1f}")
+
+    # Train variant
+    var, _, var_p = train(args.variant, cfg, device,
+                          from_checkpoint=not args.from_scratch, **kw)
+
+    # Results
+    print(f"\n{'='*60}")
+    print(f"  {args.variant}: best PPL = {min(var_p):.1f}")
+    print(f"  Known standard baseline: ~206-209")
+    print(f"  Params: {var.count_params():,}")
+    print(f"{'='*60}")
+
+    # Quick generation samples
+    var = var.cpu()
+    enc = tiktoken.get_encoding("gpt2")
+    print("\n  SAMPLES:")
+    for prompt in PROMPTS:
+        print(f"  \"{prompt}\"")
+        print(f"    → {generate(var, enc, prompt)}\n")
+
+if __name__ == "__main__":
+    main()
