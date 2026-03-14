@@ -99,8 +99,9 @@ dog's relational structure to predict cat's associates?
 
 | Variant | Architecture | Best PPL | vs Standard |
 |---------|-------------|:--------:|:-----------:|
-| Standard | Q·K dot product | **208** | baseline |
-| Hybrid v4 | Q·K + learnable Plücker bias | **207** | 1.00x (tied) |
+| Standard | Q·K dot product | 209 | baseline |
+| **Online memory** | **Q·K + causal Gram accumulation** | **206** | **0.99x (wins!)** |
+| Hybrid v4 | Q·K + learnable Plücker bias | 207 | 1.00x (tied) |
 | Bigram v3 | Token-pair query lines, single-token key lines | 215 | 1.03x worse |
 | Kernel v2 | Asymmetric Q/K line projections | 252 | 1.21x worse |
 | Original v1 | Symmetric -log|incidence| | 2063 | 10.0x worse |
@@ -108,6 +109,10 @@ dog's relational structure to predict cat's associates?
 ### Key findings
 
 - Plücker geometry **cannot replace** dot-product attention but **can augment** it
+- **Online Gram accumulation is the first variant to beat standard attention** (PPL 206 vs 209)
+  - Causal M_t = Σ_{s<t} decay^{t-s} · p_s⊗p_s creates differentiable growing memory
+  - Only 56,652 memory-specific parameters (0.5% overhead)
+  - Bigram write lines + separate read projections + sigmoid gating
 - Degree-4 interactions help when they encode context (bigram > kernel)
 - The original failure was architectural (symmetry, -log|.|, expressivity), not mathematical
 - Learned Plücker projections ≈ random projections for retrieval (geometry is decorative for discriminative tasks)
