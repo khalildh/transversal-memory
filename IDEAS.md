@@ -1,137 +1,187 @@
-# Ideas for further exploration
+# Ideas
 
-## Sequence prediction / Transformer replacement
+## Active: Memory-integrated attention
 
-- **Use the system as a transformer-like sequence predictor**: encode token sequences
-  as Plücker lines, use transversals to predict next tokens. The geometric constraint
-  (transversal must intersect all stored lines) is analogous to attention over context.
+### 1. Memory-augmented attention ← building now
 
-- **Token-level operation**: Replace word-level embeddings with subword token
-  embeddings (BPE/SentencePiece). This would test whether the geometric structure
-  captures syntactic/sequential patterns, not just semantic associations.
+Add an external Gram memory bank to a transformer with hybrid Plücker attention.
+Each attention head computes standard Q·K over the sequence *plus* scores each
+query against stored Gram matrices using the Plücker inner product. The query
+line from token i gets scored against the memory's stored lines — same `p·(★q)`
+operation the memory already uses. Output is a weighted combination of sequence
+values and memory-retrieved values.
 
-- **General sequence prediction**: Given a sequence [t1, t2, ..., tn], encode
-  consecutive pairs as lines, compute transversals, and use them to predict t_{n+1}.
-  Compare against n-gram baselines and simple RNNs.
+This is a direct extension of hybrid v4 — instead of the Plücker bias coming
+only from other tokens in the sequence, it also comes from an external Gram
+matrix storing relational knowledge.
 
-- **Attention as Plücker intersection**: Each attention head could be viewed as
-  finding transversal lines through the "context lines" formed by key-value pairs.
-  The Plücker inner product is a natural measure of "relevance" between a query
-  line and stored context lines.
+**Why it works**: The Plücker inner product is the same operation in both the
+memory system and the attention mechanism. No adapter needed.
 
-## Current best results (autoresearch)
+### 2. Transversal retrieval as context injection
 
-- Cosine NN baseline: p@10 = 0.074
-- Pure geometric (transversals): p@10 = 0.011
-- Linear blend (cos + geometry): p@10 = 0.085 (+14.9%)
-- 4-signal RRF (cos+cent+max+avg): p@10 = 0.100 (+35.1%)
-- 5-signal RRF (+top-3 mean): p@10 = 0.104 (+40.5%)
-- 6-signal RRF (+source tgt space): p@10 = 0.108 (+45.9%)
-- 7-signal RRF (+reciprocal NN): p@10 = 0.114 (+53.4%)
-- 8-signal RRF (+Mahalanobis): p@10 = 0.119 (+60.8%)
-- 10-signal RRF (+whitened cos, maha-src): p@10 = 0.123 (+66.2%)
-- **8-signal RRF (ablation-pruned, RECIP_K=32): p@10 = 0.128 (+73.0%)**
+Given a prompt, use the generative mode (4 lines → 2 transversals) to retrieve
+related concepts from the Gram memory, then prepend them as additional context
+tokens. The transformer processes them alongside the input.
+
+Simpler than option 1 — doesn't require modifying the attention mechanism at all.
+Just uses memory as a retrieval augmentation step before inference.
+
+### 3. Online memory accumulation ★ most interesting
+
+As the model processes text, it accumulates Plücker lines into Gram matrices
+(the `M = Σ pᵢ⊗pᵢ` operation) in real time. Later tokens can query these
+accumulated memories. Similar to Neural Turing Machines or modern Hopfield
+networks, but using geometric incidence instead of dot-product addressing.
+
+**Why this is the most interesting**: It creates a differentiable, growing
+memory that captures relational structure (not just content) and can be queried
+geometrically. The Gram matrix eigenvectors become "principal relational axes"
+that emerge during processing — the model discovers what the text is *about*
+as it reads.
+
+Key design questions:
+- Write head: which token pairs get stored as Plücker lines?
+- Read head: how does the current token query the accumulated Gram matrix?
+- Forgetting: does M grow forever, or is there a decay/gating mechanism?
+- Multi-scale: separate fast (sentence) and slow (document) Gram memories?
+
+### 4. Higher Grassmannian attention
+
+Use G(2,6) with 15D Plücker coordinates instead of G(2,4) with 6D. The higher
+Grassmannian provides more geometric room for discrimination (demonstrated by
+the 2.6x improvement in generation quality from G(2,4) to G(2,6)). The
+attention mechanism would use 15D incidence instead of 6D.
+
+Trade-off: more parameters per head (15D vs 6D coordinates), but potentially
+much richer geometric interactions.
+
+## Active: Retrieval and reasoning
+
+### 5. Few-shot relational reasoning
+
+The geometric system has a demonstrated crossover point at K≥10 seed associates
+where it outperforms embeddings. Build an interface for few-shot relational
+tasks: given 10-20 examples of a relation (e.g., country→capital), the Gram
+matrix captures the relational pattern and can score new candidates.
+
+Unique advantage: works with the existing PPMI+SVD embeddings, no neural
+network training needed. The geometry does the heavy lifting.
+
+### 6. Compositional transversal chains
+
+Chain multiple transversal operations: output of one query becomes input to
+the next. This is the geometric analogue of multi-hop reasoning. Already
+demonstrated with music→bassist→multitrack→arpeggio chains.
+
+Could be formalized as a graph traversal where each step uses the
+multi-transversal generation to propose next nodes, and the Gram energy
+scoring to filter.
+
+### 7. Cross-word geometry transfer
+
+The Gram matrix comparison (e.g., dog/cat similarity = 0.86) captures relational
+structure. Can this be used for zero-shot transfer of associate patterns between
+related source words? If dog and cat have similar Gram matrices, can we use
+dog's relational structure to predict cat's associates?
+
+## Plücker attention LM experiment results
+
+### Results summary
+
+| Variant | Architecture | Best PPL | vs Standard |
+|---------|-------------|:--------:|:-----------:|
+| Standard | Q·K dot product | **208** | baseline |
+| Hybrid v4 | Q·K + learnable Plücker bias | **207** | 1.00x (tied) |
+| Bigram v3 | Token-pair query lines, single-token key lines | 215 | 1.03x worse |
+| Kernel v2 | Asymmetric Q/K line projections | 252 | 1.21x worse |
+| Original v1 | Symmetric -log|incidence| | 2063 | 10.0x worse |
+
+### Key findings
+
+- Plücker geometry **cannot replace** dot-product attention but **can augment** it
+- Degree-4 interactions help when they encode context (bigram > kernel)
+- The original failure was architectural (symmetry, -log|.|, expressivity), not mathematical
+- Learned Plücker projections ≈ random projections for retrieval (geometry is decorative for discriminative tasks)
+- Hybrid approach matches standard — geometric incidence captures complementary structure
+
+### What went wrong (v1) and fixes
+
+1. **Symmetric Q/K**: attn(i,j) = attn(j,i) → fixed with separate projections
+2. **-log|incidence| scoring**: spiky gradients → fixed with signed inner product
+3. **Single-token lines**: too little expressivity → fixed with bigram encoding
 
 ## Resolved questions
 
-- **Does higher Grassmannian help the hybrid?** No. Tested G(2,4) [6D],
-  G(2,6) [15D], G(2,8) [28D], and G(2,17) [136D]. All add zero unique
-  information when the full 32D embedding covariance is exploited. Even
-  G(2,17) — which EXPANDS from 32D to 136D and has d-prime=6.7 and only
-  r=0.45 correlation with cosine — adds exactly 0.0pp to the ensemble.
+- **Does higher Grassmannian help the RRF ensemble?** No. G(2,4) through G(2,17)
+  all add zero unique information when full 32D embedding covariance is exploited.
 
-- **Can we ensemble across Grassmannian dimensions?** Tested G(2,4)+G(2,6)+G(2,8)
-  simultaneously. Zero improvement over embedding-only approach.
-
-- **Gram eigenstructure as features?** PCA of the Gram matrix in Plücker space
-  provides no additive signal over embedding-space PCA/covariance.
-
-- **Can transversals generate useful pseudo-associates?** No. Using P3Memory
-  to generate transversal-decoded words and adding them to the associate set
-  degrades performance from 0.128 to 0.117. The pseudo-associates are too
-  noisy and dilute the real associate signal.
-
-- **Can transversals re-rank embedding candidates?** Tested re-ranking the
-  top-100 embedding candidates using transversal incidence scores across
-  multiple projection seeds. No improvement — the Plücker inner products
-  show zero separation between associates and random words (d-prime ≈ 0)
-  with single projections, and multi-seed aggregation doesn't fix this.
-
-- **Can Plücker incidence serve as a continuous similarity signal?** Tested
-  both pairwise Plücker inner products and Gram matrix energy as RRF signals.
-  Neither adds to the ensemble. The fundamental reason: Plücker coordinates
-  are quadratic functions of projected embeddings, and the Gram energy is
-  quartic. But the embedding covariance (used in Mahalanobis/whitened cosine)
-  already captures the 2nd-order structure, which strictly dominates.
+- **Can Plücker incidence serve as a continuous similarity signal?** No. Quadratic
+  in projected embeddings, dominated by embedding covariance (Mahalanobis).
 
 - **Can an optimized Gram^0.05 multi-seed ensemble add to the RRF?** No.
-  A background agent independently optimized the pure-geometry approach to
-  p@10=0.1065 (9.7x over original 0.011) using 200 random projection seeds
-  with Gram^0.05 eigenvalue compression. Despite this dramatic standalone
-  improvement, adding it as a 9th signal degrades to 0.1270 (from 0.1280),
-  and replacing cos_src degrades to 0.1235. The information captured by
-  the Gram ensemble is entirely subsumed by embedding-space covariance signals.
+  Despite reaching p@10=0.1065 standalone (9.7x improvement), it's entirely
+  subsumed by embedding-space covariance signals.
 
-- **Does signal pruning help?** Yes — significantly. Removing cosine-to-centroid
-  (redundant with Mahalanobis-to-centroid) and top-3-mean (redundant with
-  max+mean) improved p@10 from 0.123 to 0.127. Fewer signals = less dilution
-  in rank fusion.
+- **Signal pruning?** Yes. Removing redundant signals improved p@10 from 0.123
+  to 0.128 (+4%). Fewer signals = less dilution in rank fusion.
 
-- **Which signals matter most?** Ablation study (leave-one-out on 8 signals):
-  Mahalanobis-cent is the strongest (-0.003 when removed). Whitened-cos,
-  recip-NN, and Mahalanobis-src are medium (-0.001 to -0.0015). Cosine
-  and max/mean similarity are weak (±0.0005).
+- **Mahalanobis-cent is the strongest signal** (-0.003 when ablated).
 
-- **Alternative fusion methods?** Tested z-score normalization, min-max,
-  log-product, squared RRF, weighted RRF, per-signal K values, CombMNZ,
-  Borda count. All degrade performance. Standard RRF with uniform K is optimal.
+- **Alternative fusion methods?** All degrade vs standard RRF with uniform K.
 
-- **Ledoit-Wolf shrinkage vs ridge?** Ridge regularization (MAHA_REG=0.001)
-  outperforms Ledoit-Wolf shrinkage by 0.009pp. With only 12-74 training
-  associates in 32D, the simple ridge estimate is more stable.
+## Geometry beats embeddings at K≥10
 
-## Geometry beats embeddings at associate expansion (K≥10)
+Multi-seed Gram^0.05 outperforms all embedding methods when given ≥10 seed
+associates. Crossover at K≈7-10 because 6D Plücker needs fewer samples to
+estimate structure than 32D Mahalanobis. This is the system's unique advantage.
 
-The generative benchmark (exp_generative_benchmark.py) reveals that multi-seed
-Gram^0.05 **outperforms all embedding methods** when given ≥10 seed associates:
+## Unified associative database (TDGA + transversal geometry)
 
-  | K (seeds) | Best embedding | Gram^0.05 | Winner    |
-  |-----------|---------------|-----------|-----------|
-  | 3         | 0.2565        | 0.1550    | EMBEDDING |
-  | 5         | 0.2380        | 0.2020    | EMBEDDING |
-  | 7         | 0.2215        | 0.2165    | ~TIE      |
-  | 10        | 0.1975        | 0.2090    | GEOMETRY  |
-  | 15        | 0.1713        | 0.1798    | GEOMETRY  |
-  | 20        | 0.1422        | 0.1490    | GEOMETRY  |
+Working prototype in `associative_db.py`. Combines TDGA's exact triadic recall
+with multi-seed Gram^0.05 geometric similarity and generative expansion.
 
-RRF blend (cos + centroid + max + Gram) is best at every K≥5.
+### Demonstrated
+- Exact triadic recall: "Paris capital_of ?" → France (50/50 overlap)
+- Geometric subject similarity: France↔Germany 0.54 (shared relational patterns)
+- Generative expansion: Paris → Spain, French, Germany, Italy (consistent patterns)
+- Cosine search: standard semantic retrieval over stored facts
 
-Why the crossover? Geometry operates in 6D (Plücker), needing fewer samples
-to estimate structure than 32D Mahalanobis. At K<7, too few lines for a
-meaningful Gram matrix. At K≥10, the 6D representation is well-estimated
-while 32D covariance is still noisy.
+### Directions
 
-This resolves the "generative vs discriminative" question: geometry adds
-unique information in medium-data regimes. The discriminative benchmark
-(evaluate.py) trains on 12-50 associates, where covariance is already stable
-and geometry adds zero. But at K=10-20, geometry wins standalone and adds
-unique signal in fusion.
+**Few-shot relational reasoning** ← most validated
+Feed 10-20 examples of a relation, geometry outperforms embeddings at scoring
+new candidates. No training needed — Gram matrices capture relational patterns
+from examples alone. This is the K≥10 crossover applied to structured knowledge.
+
+**Knowledge graph completion**
+The expansion operation scores unstored (subject, object) pairs by geometric
+consistency. This is link prediction without training a GNN — score candidate
+triples against accumulated Gram signatures.
+
+**Memory layer for LLM agents**
+Triadic recall is O(P²·N) regardless of corpus size. An agent stores facts as
+(entity, relation, value) triples with constant-time recall. Geometry adds
+"what else might be true?" for reasoning beyond stored facts.
+
+**Incremental knowledge accumulation**
+Both layers support one-shot storage, no retraining. Geometric signatures
+become more discriminative as more facts arrive (more lines → richer Gram).
+
+**Anomaly / novelty detection**
+Score new candidate facts against existing geometric patterns. Low score against
+all subject signatures = genuinely novel fact. High score but unstored =
+plausible inference.
+
+### Limitations
+- Subjects with <2 facts get zero geometric signatures (need ≥2 lines for Gram)
+- Requires TDGA checkpoint + sentence-transformers (external dependencies)
+- 384D→4D projection is lossy; geometry works because ensemble (50 seeds) recovers info
 
 ## Open questions
 
-- **Cross-word geometry**: The Gram matrix comparison (e.g., dog/cat similarity
-  = 0.86) captures relational structure. Can this be used for zero-shot transfer
-  of associate patterns between related source words?
-
-- **Sequence prediction**: Can transversals predict next tokens in sequences?
-  The geometric constraint (must intersect all context lines) is analogous to
-  attention. Worth testing on BPE-tokenized text.
-
-- **Optimal K regime**: Geometry crosses over at K≈7-10. Can the Gram ensemble
-  be made more sample-efficient (fewer seeds needed) via better projection
-  selection, adaptive power transforms, or Bayesian Gram estimation?
-
-- **Higher-order interactions**: The embedding ensemble captures up to 2nd-order
-  (covariance) structure. Could non-linear kernels or tensor decompositions
-  in the original 32D space (without lossy projection) capture useful higher-order
-  interactions?
+- **Optimal K regime**: Can the Gram ensemble be made more sample-efficient?
+- **Higher-order interactions**: Non-linear kernels or tensor decompositions
+  in 32D without lossy projection to capture useful higher-order interactions?
+- **Sequence prediction via transversals**: Can geometric constraints predict
+  next tokens in BPE-tokenized text?
