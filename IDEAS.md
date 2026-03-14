@@ -58,15 +58,23 @@ much richer geometric interactions.
 
 ## Active: Retrieval and reasoning
 
-### 5. Few-shot relational reasoning
+### 5. Few-shot relational reasoning ← TESTED, negative with neural embeddings
 
-The geometric system has a demonstrated crossover point at K≥10 seed associates
-where it outperforms embeddings. Build an interface for few-shot relational
-tasks: given 10-20 examples of a relation (e.g., country→capital), the Gram
-matrix captures the relational pattern and can score new candidates.
+Tested with 384D MiniLM sentence embeddings across 5 relations (country→capital,
+animal→sound, material→product, country→language, profession→tool), 25 pairs each.
 
-Unique advantage: works with the existing PPMI+SVD embeddings, no neural
-network training needed. The geometry does the heavy lifting.
+Results: geometry loses at ALL K values. Best geometry (Gram^0.05 on PCA-16D)
+reaches p@10=0.84 vs cosine centroid p@10=0.91. Offset-based Gram (encoding
+relational transformation tgt-src) is even worse (p@10=0.43).
+
+Root cause: 384D neural embeddings already capture relational semantics so well
+that cosine similarity achieves >0.9 precision. Geometry can only lose information
+through the 384D→4D projection. The K≥10 crossover from the word association
+benchmark only occurs with weak embeddings (32D PPMI+SVD).
+
+**The geometry's niche is weak embeddings + medium data.** When embeddings are
+information-poor (statistical, low-D, non-neural), Plücker projection extracts
+complementary structure. With modern sentence transformers, it's strictly dominated.
 
 ### 6. Compositional transversal chains
 
@@ -149,10 +157,10 @@ with multi-seed Gram^0.05 geometric similarity and generative expansion.
 
 ### Directions
 
-**Few-shot relational reasoning** ← most validated
-Feed 10-20 examples of a relation, geometry outperforms embeddings at scoring
-new candidates. No training needed — Gram matrices capture relational patterns
-from examples alone. This is the K≥10 crossover applied to structured knowledge.
+**Few-shot relational reasoning** ← NEGATIVE with neural embeddings
+Tested: geometry loses at all K values when using 384D MiniLM embeddings.
+Cosine centroid p@10=0.91 vs best geometry p@10=0.84. The K≥10 crossover
+only applies with weak (32D PPMI+SVD) embeddings. See §5 above.
 
 **Knowledge graph completion**
 The expansion operation scores unstored (subject, object) pairs by geometric
@@ -180,6 +188,8 @@ plausible inference.
 
 ## Open questions
 
+- **Geometry only helps with weak embeddings**: Can geometry add to neural embedding
+  systems in any task, or is the K≥10 crossover specific to co-occurrence vectors?
 - **Optimal K regime**: Can the Gram ensemble be made more sample-efficient?
 - **Higher-order interactions**: Non-linear kernels or tensor decompositions
   in 32D without lossy projection to capture useful higher-order interactions?
