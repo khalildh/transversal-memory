@@ -7,4 +7,6 @@ build/
 .eggs/
 data/
 .venv/
+checkpoints/
+uv.lock
 

@@ -525,3 +525,82 @@ Three key discoveries:
    retrieval (transversals rank targets 1-3/67K in cherry-picked queries) but
    adds nothing to discriminative ranking when high-quality embeddings are
    available. The two modes solve fundamentally different problems.
+
+---
+
+## Plücker attention: language modeling experiments
+
+Can Plücker geometry replace dot-product attention in transformers? We tested
+this by training small language models (4 layers, 6 heads, d=192) on WikiText-2
+with standard attention vs several Plücker-based attention mechanisms.
+
+### The core idea
+
+Standard attention computes `softmax(Q·Kᵀ/√d)` — a **degree-2** function of
+inputs. Plücker attention maps queries and keys to lines in P³ via the exterior
+product `a∧b`, then uses the Plücker inner product `p·(★q)` as the attention
+logit. Since exterior products are degree-2 and the inner product multiplies
+two of them, this creates a **degree-4** interaction between tokens — richer
+than standard attention's bilinear form.
+
+### Results
+
+| Variant | Architecture | Best PPL | vs Standard |
+|---------|-------------|:--------:|:-----------:|
+| Standard | Q·K dot product | **208** | baseline |
+| **Hybrid v4** | Q·K + learnable Plücker bias | **207** | 1.00x (tied) |
+| Bigram v3 | Token-pair query lines, single-token key lines | 215 | 1.03x worse |
+| Kernel v2 | Asymmetric Q/K line projections | 252 | 1.21x worse |
+| Original v1 | Symmetric -log\|incidence\| | 2063 | 10.0x worse |
+
+### What went wrong (v1) and how we fixed it
+
+The original Plücker attention (`exp_lm.py`) was catastrophically broken for
+three reasons:
+
+1. **Symmetric Q/K**: Both queries and keys used the same projection, so
+   `attn(i,j) = attn(j,i)`. Attention needs asymmetry to flow information
+   directionally.
+2. **-log|incidence| scoring**: Taking `-log` of the absolute Plücker inner
+   product creates a spiky loss landscape with poor gradient flow. Lines that
+   nearly meet get infinite attention; lines that cross get zero.
+3. **Single-token lines**: Each token maps to one line. With only 4D projections,
+   lines lack the expressivity to capture token identity.
+
+### Three architectural fixes (`exp_lm_variants.py`)
+
+**Kernel attention (v2)**: Separate W1/W2 projections for queries and keys,
+signed Plücker inner product as logits (no -log|.|). This fixes symmetry and
+gradient flow but still uses single-token lines. Result: 252 PPL (1.21x worse).
+
+**Bigram attention (v3)**: Query lines encode consecutive token pairs —
+`x_bigram = [x_i; x_{i-1}]` projected to two R⁴ points, then exterior product.
+Key lines come from single tokens. This creates degree-4 interactions that
+capture local context. Result: 215 PPL (1.03x worse).
+
+**Hybrid attention (v4)**: Standard Q·K attention + additive Plücker bias with
+a learned per-head scale parameter (initialized to 0.1). This lets the model
+use geometric information as a supplement rather than replacement. Result:
+207 PPL (tied with standard).
+
+### Key findings
+
+1. **Plücker geometry cannot replace dot-product attention** — but it can
+   augment it. The hybrid approach matches standard performance, suggesting
+   geometric incidence captures complementary structure.
+
+2. **Degree-4 interactions help when they encode context**: Bigram attention
+   (which encodes token pairs) nearly matches standard attention, while
+   kernel attention (single tokens) falls behind. The geometric nonlinearity
+   is useful when it operates on meaningful local structure.
+
+3. **The original failure was architectural, not mathematical**: Fixing
+   symmetry, gradient flow, and expressivity progressively closed the gap
+   from 10x worse to parity. The geometry itself is sound.
+
+4. **Learned Plücker projections ≈ random projections** for retrieval
+   (`exp_learn.py`): On the word association task, trained Plücker heads
+   (p@10=0.1200) performed identically to random projections (p@10=0.1225).
+   This confirms the geometry is decorative for discriminative retrieval —
+   it acts as a nonlinear feature map whose specific parameterization
+   doesn't matter.
