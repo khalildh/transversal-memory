@@ -152,7 +152,7 @@ signal. λ=0.99 (half-life ≈ 69 tokens) is the sweet spot, but the advantage
 still shrinks from 3.3% → 0.8% going 128 → 256 tokens. The real bottleneck
 is the 6D Gram space saturating, not the temporal weighting.
 
-#### 3e. Triadic-seeded Gram memory ← TESTING
+#### 3e. Triadic-seeded Gram memory ← TESTED, doesn't help
 
 **Status: fast screening shows +2% improvement (494.8 → 485.2 PPL, 2-layer)**
 
@@ -211,11 +211,15 @@ Per-sequence storage test (2-layer, 7 epochs, from scratch):
 7. **Contrastive seed loss**: Add auxiliary loss that encourages the model's
    online Gram at position T to be close to the recalled seed Gram. This
    regularizes the Gram space to be consistent across related sequences.
-8. **Short-sequence test (seq=16-32)**: At very short sequences the model
-   barely builds up M before the sequence ends — cold-start is a real
-   disadvantage. A recalled Gram seed should matter most here where the
-   model doesn't have enough tokens to build its own structural summary.
-   This is the clearest test of whether cross-sequence memory adds value.
+8. **Short-sequence test (seq=32)** ← TESTED, no benefit:
+   At seq=32 the model barely builds M before the sequence ends, so a
+   recalled Gram seed should matter most here. Result: PPL 265.8 seeded
+   vs 266.4 baseline (-0.2%, noise). Even with minimal tokens to build
+   structure, the model adapts fast enough that cross-sequence memory
+   adds no value. This effectively closes the triadic seeding approach —
+   it doesn't help at any sequence length (32, 128) or model size (2, 4
+   layers). The SDR encode/decode pipeline is too lossy and the model's
+   learned projections already handle cold-start efficiently.
 
 #### 3f. Multi-scale memory
 

@@ -648,6 +648,7 @@ def main():
     parser.add_argument("--seed-start", type=int, default=1, help="Epoch to start seeding (0-indexed)")
     parser.add_argument("--per-seq", action="store_true", help="Per-sequence storage (sharper topic signal)")
     parser.add_argument("--bs", type=int, default=None, help="Override batch size")
+    parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -655,6 +656,9 @@ def main():
     cfg.n_epochs = args.epochs
     cfg.decay = args.decay
     cfg.seed_start_epoch = args.seed_start
+
+    if args.seq_len:
+        cfg.seq_len = args.seq_len
 
     if args.bs:
         cfg.batch_size = args.bs
