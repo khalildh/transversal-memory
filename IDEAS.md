@@ -62,18 +62,28 @@ related. The attention pathway preserves this information.
 
 #### 3b. Longer sequences ← TESTED, peaks at 256
 
+4-layer results (10 epochs from scratch):
+
 | Seq len | Standard | Online mem | Delta | % |
 |---------|----------|-----------|-------|---|
 | 128 | ~244 | ~244 | ~0 | ~0% |
 | 256 | 259.1 | **250.8** | **-8.3** | **3.2%** |
 | 512 | 282.7 | 279.6 | -3.1 | 1.1% |
 
-(All 4-layer, 10 epochs from scratch, matched batch sizes)
+2-layer fast screening (10 epochs from scratch, d=128, 4 heads):
+
+| Seq len | Standard | Online mem | Delta | % |
+|---------|----------|-----------|-------|---|
+| 256 | 432.3 | **421.8** | **-10.5** | **2.4%** |
 
 The advantage peaks at seq=256 then declines at 512. This confirms the 6D
 Gram saturation hypothesis: a rank-6, 21-independent-entry matrix can only
 encode so much structure. At 256 tokens it captures useful patterns; at 512
 it's overwhelmed.
+
+The 2-layer result at seq=256 confirms this isn't a fluke of the 4-layer
+architecture — geometry helps at both scales, though more at 4 layers (3.2%
+vs 2.4%) where the model has more capacity to refine the geometric signal.
 
 This makes a strong case for higher-dimensional Plücker spaces (idea 4) or
 the multi-scale memory with separate fast/slow banks (idea 3f) for longer
@@ -201,6 +211,11 @@ Per-sequence storage test (2-layer, 7 epochs, from scratch):
 7. **Contrastive seed loss**: Add auxiliary loss that encourages the model's
    online Gram at position T to be close to the recalled seed Gram. This
    regularizes the Gram space to be consistent across related sequences.
+8. **Short-sequence test (seq=16-32)**: At very short sequences the model
+   barely builds up M before the sequence ends — cold-start is a real
+   disadvantage. A recalled Gram seed should matter most here where the
+   model doesn't have enough tokens to build its own structural summary.
+   This is the clearest test of whether cross-sequence memory adds value.
 
 #### 3f. Multi-scale memory
 
