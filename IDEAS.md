@@ -280,6 +280,38 @@ part of the attention computation.
 
 **Lesson**: Geometry should augment, not compete. Scalar gating > dual pathway.
 
+#### 3j. Online associative memory ← TESTING
+
+**Status: running fast 2-layer screening**
+
+Instead of seeding M₀ once at sequence start (which doesn't help at any
+sequence length or model size), give the model a persistent associative
+memory that it reads/writes at every position during the forward pass.
+
+Architecture:
+- Keys: Plücker write lines (6D per head, flattened to 36D per position)
+- Values: hidden states (d_model per position)
+- Storage: write every 8 positions during training (controls memory growth)
+- Retrieval: batched GPU queries at every position via matrix multiply
+  against indicator matrices. All B×T queries computed in one matmul.
+- Integration: recalled values → learned linear projection → scalar gate
+  (starts small at 0.01, model learns how much to trust the memory)
+
+Key differences from triadic seeding (3e):
+1. Query at every position, not just sequence start
+2. Keys are geometric (write lines), not semantic (context embeddings)
+3. Values are hidden states, not Gram matrices
+4. Batched GPU queries instead of one-at-a-time CPU queries
+5. The memory is truly associative — "what have I seen before that looks
+   geometrically like what I'm seeing now?"
+
+Implementation: `exp_assoc_mem.py`
+
+Concern: double forward pass per batch (one no-grad to get write lines
+for queries, then the real forward with recalled values). This doubles
+compute when reading is active. Could optimize by caching write lines
+from the previous batch instead.
+
 ### 4. Higher Grassmannian attention
 
 Use G(2,6) with 15D Plücker coordinates instead of G(2,4) with 6D. The higher
