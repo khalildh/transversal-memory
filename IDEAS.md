@@ -324,6 +324,17 @@ The seq=256 penalty (10.1%→7.3% for 1-layer) persists even at high
 capacity deficit, confirming the 6D Gram saturation is intrinsic to the
 geometric representation, not model capacity.
 
+Data scaling (2-layer d=128, seq=128):
+
+| Data fraction | Standard PPL | Online Mem PPL | Gap |
+|---------------|-------------|----------------|-----|
+| 50% | 524.3 | 505.3 | -3.6% |
+| 100% | 330.0 | 326.6 | -1.0% |
+
+More data reduces geometry advantage too — the model learns internally
+what the Gram was providing. The geometry benefit is largest in the
+**low-capacity, low-data regime** (shallow model, limited data).
+
 Width vs depth: geometry benefit depends on DEPTH, not total capacity:
 
 | Config | Params | Standard | Online Mem | Gap |
