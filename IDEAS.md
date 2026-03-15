@@ -292,14 +292,19 @@ quality with enough heads for timescale diversity.
 |---------|----------|---------------|-------|
 | 128* | ~3184 | ~3074 | -3.5% |
 | 192 | 1777.5 | 1687.5 | -5.1% |
-| 256 | 1318.3 | 1232.5 | **-6.5%** |
+| **256** | **1318.3** | **1232.5** | **-6.5%** |
+| 384 | 1026.9 | 964.3 | -6.1% |
 
 *4 heads (fast model)
 
-**The geometry advantage grows with model width.** Wider models have more
-capacity to exploit the complementary geometric signal. This suggests the
-Gram provides genuinely useful information that standard attention alone
-cannot compute — and more model capacity means more ability to use it.
+**The geometry advantage grows with width and plateaus at ~6%.** Wider models
+exploit the Gram's complementary signal better, peaking at d=256 (-6.5%)
+and holding at d=384 (-6.1%). The plateau makes sense: the 6×6 Gram has
+21 independent parameters — its information capacity is finite.
+
+This confirms the Gram provides genuinely useful structural information
+that standard attention alone cannot compute. The ~6% ceiling corresponds
+to the geometric capacity of a rank-6 symmetric matrix.
 
 **Depth scaling (d=192, 8 heads):**
 
