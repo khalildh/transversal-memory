@@ -163,6 +163,13 @@ Full model (4-layer, 10 epochs, from scratch, bs=64):
 3. Batch-averaged context + Gram is too coarse — all topics blur together
 4. Seeded eval never helps — the learned weights already capture the signal
 
+Per-sequence storage test (2-layer, 7 epochs, from scratch):
+- Baseline: PPL 492.7
+- Seeded (per-seq, 25% subsample): PPL tracking ~5% better per epoch
+  BUT epoch times explode (72s → 454s at 28k triples) as triadic
+  memory grows. Per-sequence recall does 128×n_layers queries per batch.
+- **Per-seq storage is impractical** without batched triadic queries.
+
 **Optimization ideas to test:**
 1. **Per-sequence storage** (not batch-averaged): current approach averages
    context across 128 sequences in a batch, losing topic signal. Store each

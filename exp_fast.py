@@ -240,6 +240,8 @@ class MultiScaleMemoryAttention(nn.Module):
         total_incidence_sq = torch.zeros(B, H, T, T, device=x.device)
 
         for offset in self.offsets:
+            if offset >= T:
+                continue  # skip offsets larger than sequence
             # Shift x by offset positions
             x_past = torch.cat([
                 torch.zeros(B, offset, D, device=x.device),
@@ -256,8 +258,10 @@ class MultiScaleMemoryAttention(nn.Module):
             inc_sq = inc_sq.masked_fill(causal, 0.0)
             total_incidence_sq = total_incidence_sq + inc_sq
 
-        # Average across offsets
-        total_incidence_sq = total_incidence_sq / len(self.offsets)
+        # Average across active offsets
+        n_active = sum(1 for o in self.offsets if o < T)
+        if n_active > 0:
+            total_incidence_sq = total_incidence_sq / n_active
 
         # Temporal decay
         if self.decay != 1.0:
