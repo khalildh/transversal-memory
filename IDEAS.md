@@ -60,15 +60,24 @@ need to softmax it and multiply by values instead of squaring and summing.
 is my query to the past?" but throws away *which* past tokens are geometrically
 related. The attention pathway preserves this information.
 
-#### 3b. Longer sequences (512, 1024)
+#### 3b. Longer sequences ← TESTED, peaks at 256
 
-At seq_len=128, standard attention can see everything — the compressed Gram
-summary isn't needed. At 512+, the Gram memory becomes more valuable because
-it summarizes structure beyond the attention window. The 3 PPL improvement at
-128 should grow at longer sequences where standard attention is more strained.
+| Seq len | Standard | Online mem | Delta | % |
+|---------|----------|-----------|-------|---|
+| 128 | ~244 | ~244 | ~0 | ~0% |
+| 256 | 259.1 | **250.8** | **-8.3** | **3.2%** |
+| 512 | 282.7 | 279.6 | -3.1 | 1.1% |
 
-Easy to test: just change Config.seq_len. May need to reduce batch_size to
-fit in memory.
+(All 4-layer, 10 epochs from scratch, matched batch sizes)
+
+The advantage peaks at seq=256 then declines at 512. This confirms the 6D
+Gram saturation hypothesis: a rank-6, 21-independent-entry matrix can only
+encode so much structure. At 256 tokens it captures useful patterns; at 512
+it's overwhelmed.
+
+This makes a strong case for higher-dimensional Plücker spaces (idea 4) or
+the multi-scale memory with separate fast/slow banks (idea 3f) for longer
+sequences.
 
 #### 3c. Tune decay parameter ← TESTED, decay doesn't matter
 
