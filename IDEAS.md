@@ -389,15 +389,36 @@ for queries, then the real forward with recalled values). This doubles
 compute when reading is active. Could optimize by caching write lines
 from the previous batch instead.
 
-### 4. Higher Grassmannian attention
+### 4. Higher Grassmannian attention ← TESTED, marginal
 
-Use G(2,6) with 15D Plücker coordinates instead of G(2,4) with 6D. The higher
-Grassmannian provides more geometric room for discrimination (demonstrated by
-the 2.6x improvement in generation quality from G(2,4) to G(2,6)). The
-attention mechanism would use 15D incidence instead of 6D.
+**Status: tested March 15, 2026 — higher dims barely help**
 
-Trade-off: more parameters per head (15D vs 6D coordinates), but potentially
-much richer geometric interactions.
+Tested G(2,4)→G(2,5)→G(2,6) on 1-layer model (where geometry matters most):
+
+seq=128 (baseline standard: 695.6):
+
+| Gram | Plücker dim | Indep. entries | PPL | Gap |
+|------|-------------|----------------|-----|-----|
+| G(2,4) | 6D | 21 | 625.5 | -10.1% |
+| G(2,5) | 10D | 55 | 616.3 | -11.4% |
+| G(2,6) | 15D | 105 | 615.3 | -11.5% |
+
+seq=256 (baseline standard: 682.1):
+
+| Gram | Plücker dim | Indep. entries | PPL | Gap |
+|------|-------------|----------------|-----|-----|
+| G(2,4) | 6D | 21 | 632.2 | -7.3% |
+| G(2,5) | 10D | 55 | 630.5 | -7.6% |
+| G(2,6) | 15D | 105 | 629.5 | -7.7% |
+
+**Key finding**: 5x more Gram capacity (21→105 entries) adds only ~1.4%
+at seq=128 and ~0.4% at seq=256. The seq degradation (128→256) stays
+nearly identical across all dimensions.
+
+**Conclusion**: Saturation is NOT the bottleneck. The 6D Gram already
+captures most useful geometric structure. The information bottleneck
+is the model's ability to USE the geometric signal, not the Gram's
+ability to ENCODE it. Higher Grassmannians add marginal value.
 
 ## Active: Retrieval and reasoning
 
