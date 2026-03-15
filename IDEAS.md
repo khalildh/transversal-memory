@@ -280,9 +280,39 @@ part of the attention computation.
 
 **Lesson**: Geometry should augment, not compete. Scalar gating > dual pathway.
 
-#### 3j. Online associative memory ← TESTING
+#### 3i-b. Systematic Gram memory sweep (50% data, from scratch)
 
-**Status: running fast 2-layer screening**
+**Status: completed March 15, 2026**
+
+Fast 2-layer model (d=128, 4 heads):
+
+| Config | Standard PPL | Online Mem PPL | Gap |
+|--------|-------------|----------------|-----|
+| seq=64 | 424.0 | 423.8 | -0.05% (tied) |
+| **seq=128** | **524.3** | **505.3** | **-3.6%** |
+| seq=256 | 535.6 | 528.6 | -1.3% |
+| decay=0.95, seq=128 | (524.3) | 511.7 | -2.4% |
+| decay=0.999, seq=128 | 519.2 | 513.0 | -1.2% |
+| multi_scale, seq=128 | (524.3) | 517.2 | -1.4% |
+
+Full 4-layer model (d=192, 6 heads):
+
+| Config | Standard PPL | Online Mem PPL | Gap |
+|--------|-------------|----------------|-----|
+| seq=128 | 418.1 | 417.7 | -0.1% |
+
+**Findings**:
+1. Geometry advantage strongest at seq=128 with 2-layer model (3.6%)
+2. At seq=64, too few tokens for Gram to accumulate useful structure
+3. At seq=256, 6D Gram saturates (consistent with prior results)
+4. 4-layer model absorbs geometry benefit — more layers = less need for explicit Gram memory
+5. decay=0.99 > decay=0.95 > decay=0.999 (medium forgetting is optimal)
+6. multi_scale worse than single-scale online_mem at 2 layers
+7. Baselines vary ±5 PPL across runs (random init) — relative gap is the stable metric
+
+#### 3j. Online associative memory (SDR-based) ← SHELVED
+
+**Status: shelved — indicator memory recall returns uniform distribution**
 
 Instead of seeding M₀ once at sequence start (which doesn't help at any
 sequence length or model size), give the model a persistent associative
