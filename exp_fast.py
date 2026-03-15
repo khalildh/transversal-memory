@@ -541,6 +541,652 @@ class LearnedDecayMemoryAttention(nn.Module):
         return self.out(seq_out + gated * mem_val)
 
 
+class ResidualLearnedDecayAttention(nn.Module):
+    """Best of both: learned per-head decay + residual multiplicative gating.
+
+    Combines: (1 + gram_gate) * seq_out (from residual_gram)
+    with learned per-head λ (from learned_decay).
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        incidence_sq = incidence_sq * weights.unsqueeze(0)
+
+        mem_score = incidence_sq.sum(dim=-1)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gram_mod = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gram_mod = gram_mod.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out * (1.0 + gram_mod))
+
+
+class LearnedPowerMemoryAttention(nn.Module):
+    """Like LearnedDecay but with learned per-head power for incidence.
+
+    incidence^p where p is learned (via softplus to stay > 0).
+    p=2 is the current default; model may find that p=1, p=3, or
+    fractional powers work better.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+        # Learned power: softplus(raw) → p > 0, init near 2.0
+        # softplus(0.7) ≈ 1.1, we want init ~2, so raw ≈ 1.3
+        self.power_raw = nn.Parameter(torch.full((n_heads,), 1.3))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+
+        # Learned power: |incidence|^p
+        power = F.softplus(self.power_raw)  # (H,) > 0
+        inc_powered = incidence.abs().clamp(min=1e-8) ** power.reshape(1, H, 1, 1)
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        inc_powered = inc_powered.masked_fill(causal, 0.0)
+
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        inc_powered = inc_powered * weights.unsqueeze(0)
+
+        mem_score = inc_powered.sum(dim=-1)
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+        return self.out(seq_out + gated * mem_val)
+
+
+class ResidualGramAttention(nn.Module):
+    """Gram-modulated residual: (1 + gram_gate) * seq_out.
+
+    Instead of adding a separate gated value, scale the standard attention
+    output by the Gram signal. Positions with strong geometric memory get
+    amplified, weak ones stay at 1x.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        incidence_sq = incidence_sq * weights.unsqueeze(0)
+
+        mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        # Residual modulation: (1 + small_gate) * seq_out
+        gram_mod = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gram_mod = gram_mod.mean(dim=-1, keepdim=True)  # (B, T, 1)
+
+        return self.out(seq_out * (1.0 + gram_mod))
+
+
+class AbsIncidenceMemoryAttention(nn.Module):
+    """Like LearnedDecay but uses |incidence| instead of incidence².
+
+    |incidence| is less aggressive than squaring — preserves more signal
+    from moderate-strength geometric matches.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+
+        # |incidence| instead of incidence²
+        inc_abs = incidence.abs()
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        inc_abs = inc_abs.masked_fill(causal, 0.0)
+
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        inc_abs = inc_abs * weights.unsqueeze(0)
+
+        mem_score = inc_abs.sum(dim=-1)
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+        return self.out(seq_out + gated * mem_val)
+
+
+class TrigramWriteMemoryAttention(nn.Module):
+    """Write lines from trigrams [x_{t-2}, x_{t-1}, x_t] with learned decay.
+
+    Uses 3 tokens to form the write line instead of 2: both previous tokens
+    project to the first point, current token to the second. Captures wider
+    local context in each Gram entry.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        # Write: first point from [x_{t-2}; x_{t-1}] concat, second from x_t
+        self.W1_write = nn.Linear(2 * d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # Trigram context: [x_{t-2}; x_{t-1}] concatenated
+        z = torch.zeros(B, 1, D, device=x.device)
+        x_prev1 = torch.cat([z, x[:, :-1]], dim=1)       # x_{t-1}
+        x_prev2 = torch.cat([z, z, x[:, :-2]], dim=1)     # x_{t-2}
+        trigram_ctx = torch.cat([x_prev2, x_prev1], dim=-1)  # (B, T, 2D)
+
+        pd = self.point_dim
+        w1 = self.W1_write(trigram_ctx).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        incidence_sq = incidence_sq * weights.unsqueeze(0)
+
+        mem_score = incidence_sq.sum(dim=-1)
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+        return self.out(seq_out + gated * mem_val)
+
+
+class IncidenceBiasAttention(nn.Module):
+    """Incidence as additive attention bias with learned decay.
+
+    Instead of collapsing Gram to a scalar gate, add the raw incidence
+    (with temporal weighting) as a bias to the Q·K attention logits.
+    This lets geometry influence WHICH tokens to attend to, not just
+    whether to gate in a separate value.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+        # Per-head scale for the incidence bias
+        self.bias_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_logits = (q @ k.transpose(-1, -2)) * self.scale  # (B, H, T, T)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)  # (B, H, T, T)
+
+        # Temporal weighting with learned decay
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        weighted_inc = incidence * weights.unsqueeze(0)
+
+        # Add incidence as bias to attention logits
+        bias = weighted_inc * self.bias_scale.reshape(1, H, 1, 1)
+        logits = std_logits + bias
+
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        logits = logits.masked_fill(mask, float('-inf'))
+        attn = self.drop(F.softmax(logits, dim=-1))
+        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        return self.out(out)
+
+
+class MultiWriteMemoryAttention(nn.Module):
+    """Online Gram with multiple write lines per position.
+
+    Instead of 1 line per position (from bigram), write K lines using
+    K different projection pairs. More lines = richer Gram structure.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True,
+                 n_write_pairs=2, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.n_write_pairs = n_write_pairs
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        # Multiple write projection pairs
+        self.W1_writes = nn.ModuleList([
+            nn.Linear(d_model, point_dim * n_heads, bias=False)
+            for _ in range(n_write_pairs)
+        ])
+        self.W2_writes = nn.ModuleList([
+            nn.Linear(d_model, point_dim * n_heads, bias=False)
+            for _ in range(n_write_pairs)
+        ])
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        J = self.J
+
+        # Read lines
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+        read_h = read_lines.permute(0, 2, 1, 3)
+
+        # Accumulate incidence² from all write pairs
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        total_incidence_sq = torch.zeros(B, H, T, T, device=x.device)
+
+        for W1, W2 in zip(self.W1_writes, self.W2_writes):
+            w1 = W1(x_prev).reshape(B, T, H, pd)
+            w2 = W2(x).reshape(B, T, H, pd)
+            write_lines = exterior(w1, w2, self.pairs)
+            J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+            Jwrite_h = J_write.permute(0, 2, 1, 3)
+            incidence = read_h @ Jwrite_h.transpose(-1, -2)
+            inc_sq = incidence ** 2
+            inc_sq = inc_sq.masked_fill(causal, 0.0)
+            total_incidence_sq = total_incidence_sq + inc_sq
+
+        total_incidence_sq = total_incidence_sq / self.n_write_pairs
+
+        # Learned per-head decay
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        total_incidence_sq = total_incidence_sq * weights.unsqueeze(0)
+
+        mem_score = total_incidence_sq.sum(dim=-1)
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
+class IncidenceRouteAttention(nn.Module):
+    """Incidence-weighted value routing with learned decay.
+
+    Instead of a scalar gate, use the temporal-weighted incidence
+    to weight past tokens' values directly (like attention but with
+    geometric scores). Combined additively with standard attention.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.geo_value = nn.Linear(d_model, d_model)
+        self.route_gate = nn.Parameter(torch.tensor(0.01))  # start small
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)  # (B, H, T, T)
+
+        # Temporal weighting with learned decay
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+
+        # Use |incidence| * temporal as routing weights (softmax over past)
+        route_scores = incidence.abs() * weights.unsqueeze(0)
+        route_scores = route_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), 0.0)
+        # Normalize: softmax over past positions
+        route_scores = route_scores / (route_scores.sum(dim=-1, keepdim=True).clamp(min=1e-8))
+
+        # Route geometric values
+        geo_v = self.geo_value(x).reshape(B, T, H, dh).permute(0, 2, 1, 3)
+        geo_out = (route_scores @ geo_v).transpose(1, 2).reshape(B, T, D)
+
+        combined = seq_out + self.route_gate * geo_out
+        return self.out(combined)
+
+
 # ── Model ────────────────────────────────────────────────────────────────────
 
 ATTN_CLASSES = {
@@ -550,6 +1196,14 @@ ATTN_CLASSES = {
     "dual_path": DualPathAttention,
     "dual_decay": DualDecayMemoryAttention,
     "learned_decay": LearnedDecayMemoryAttention,
+    "resid_learned": ResidualLearnedDecayAttention,
+    "learned_power": LearnedPowerMemoryAttention,
+    "residual_gram": ResidualGramAttention,
+    "abs_inc": AbsIncidenceMemoryAttention,
+    "trigram": TrigramWriteMemoryAttention,
+    "inc_bias": IncidenceBiasAttention,
+    "multi_write": MultiWriteMemoryAttention,
+    "inc_route": IncidenceRouteAttention,
 }
 
 class Block(nn.Module):
