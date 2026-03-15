@@ -541,6 +541,175 @@ class LearnedDecayMemoryAttention(nn.Module):
         return self.out(seq_out + gated * mem_val)
 
 
+class AttnRoutedMemoryAttention(nn.Module):
+    """Standard attention routes geometric values, Gram gates the result.
+
+    Like learned_decay but mem_val comes from attention-weighted geometric
+    values (attn @ V_geo) instead of just Linear(x_t). The standard Q·K
+    attention decides WHICH past tokens to read; the Gram decides HOW MUCH.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        # Geometric value projection (separate from standard V)
+        self.geo_value = nn.Linear(d_model, d_model, bias=False)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # Attention-routed geometric values
+        geo_v = self.geo_value(x).reshape(B, T, H, dh).permute(0, 2, 1, 3)
+        mem_out = (std_attn @ geo_v).transpose(1, 2).reshape(B, T, D)
+
+        # Gram score
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        incidence_sq = incidence_sq * weights.unsqueeze(0)
+
+        mem_score = incidence_sq.sum(dim=-1)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_out)
+
+
+class GramEnhancedKVAttention(nn.Module):
+    """Gram score modifies K and V before standard attention.
+
+    Instead of gating the output, the Gram signal enriches what standard
+    attention sees: K_enhanced = K + gram_gate * K_geo. This lets geometry
+    subtly influence both routing (via K) and content (via V).
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        # Geometric K/V projections (same shape as standard K/V)
+        self.kv_geo = nn.Linear(d_model, 2 * d_model, bias=False)
+        self.kv_gate = nn.Parameter(torch.tensor(0.01))  # start small
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, T, dh)
+
+        # Compute Gram score per position
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal_mask, 0.0)
+
+        decays = torch.sigmoid(self.decay_logits)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        incidence_sq = incidence_sq * weights.unsqueeze(0)
+        mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
+
+        # Gram gate: per-position scalar
+        scale = self.mem_scale.reshape(1, H, 1)
+        gram_gate = torch.sigmoid(mem_score * scale)  # (B, H, T)
+        gram_gate = gram_gate.unsqueeze(-1)  # (B, H, T, 1)
+
+        # Geometric K/V
+        kv_geo = self.kv_geo(x).reshape(B, T, 2, H, dh).permute(2, 0, 3, 1, 4)
+        k_geo, v_geo = kv_geo[0], kv_geo[1]  # (B, H, T, dh)
+
+        # Enhance K and V with gated geometric projections
+        k_enhanced = k + self.kv_gate * gram_gate * k_geo
+        v_enhanced = v + self.kv_gate * gram_gate * v_geo
+
+        # Standard attention with enhanced K/V
+        attn = (q @ k_enhanced.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        attn = attn.masked_fill(mask, float('-inf'))
+        attn = self.drop(F.softmax(attn, dim=-1))
+        out = (attn @ v_enhanced).transpose(1, 2).reshape(B, T, D)
+        return self.out(out)
+
+
 class ResidualLearnedDecayAttention(nn.Module):
     """Best of both: learned per-head decay + residual multiplicative gating.
 
@@ -1196,6 +1365,8 @@ ATTN_CLASSES = {
     "dual_path": DualPathAttention,
     "dual_decay": DualDecayMemoryAttention,
     "learned_decay": LearnedDecayMemoryAttention,
+    "attn_routed": AttnRoutedMemoryAttention,
+    "gram_kv": GramEnhancedKVAttention,
     "resid_learned": ResidualLearnedDecayAttention,
     "learned_power": LearnedPowerMemoryAttention,
     "residual_gram": ResidualGramAttention,
