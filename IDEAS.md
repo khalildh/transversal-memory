@@ -346,9 +346,20 @@ but the extra dimensions are redundant — the model only has 4 heads with
 32 dims each to learn structure. The 6D sweet spot balances expressivity
 with learnability.
 
-**Lesson**: The geometry's value is in the exterior product as a nonlinear
-feature map, not in the Plücker inner product or Grassmannian structure.
-Dimension 4→6 is the sweet spot for this model size.
+Full sweep (fast 2-layer, 10 epochs, ROCm):
+
+| Model | Best PPL | Plücker dim |
+|-------|----------|-------------|
+| Standard | 403.9 | — |
+| G(2,4) + J6 | **400.5** | 6D |
+| G(2,4) + identity | 400.8 | 6D |
+| G(2,5) + identity | 401.0 | 10D |
+| G(2,6) + identity | 403.7 | 15D |
+
+**Lesson**: G(2,4) is the sweet spot. Higher Grassmannians dilute the
+signal. The geometry's value is in the exterior product as a compact
+nonlinear feature map (4 coords → 6 features), not in the Plücker inner
+product or higher-dimensional Grassmannian structure.
 
 ## Active: Retrieval and reasoning
 
