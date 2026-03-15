@@ -244,10 +244,33 @@ Rapid screening (2-layer, 10% data, ROCm):
 
 **seq=512:** Too underfit with 10% data to draw conclusions.
 
-**Finding**: Per-head decay rates matter most at longer sequences where
-the Gram needs to balance local syntax and global topic structure.
-Learned decay is best at seq=256 — the model discovers optimal timescales.
-At seq=128, all decay approaches perform similarly (consistent with 3c).
+**Comprehensive variant sweep at seq=256, rapid (10% data, 2-layer):**
+
+| Rank | Variant | vs Standard | Key idea |
+|------|---------|-------------|----------|
+| 1 | **learned_decay** | **-3.5%** | Learned λ per head + additive gate |
+| 2 | dual_decay | -3.2% | Fixed fast/slow λ |
+| 3 | residual_gram | -2.8% | Multiplicative (1+g)*out |
+| 4 | multi_write | -2.3% | 2 write projection pairs |
+| 5 | trigram | -1.8% | Trigram write context |
+| 6 | online_mem | -1.7% | Single λ=0.99 |
+| 7 | abs_inc | -1.4% | |incidence| instead of ² |
+| 8 | inc_route | -0.5% | Geometry routes values |
+| 9 | learned_power | -0.2% | Learned exponent p |
+| 10 | inc_bias | +0.8% | Geometry biases attention |
+| 11 | resid_learned | +4.2% | Residual + learned (destructive!) |
+
+**Key findings from variant sweep:**
+1. **Additive scalar gate wins**: Geometry as separate gated signal > routing > bias
+2. **incidence² is optimal**: Learned power and |incidence| don't improve
+3. **Learned per-head decay is the strongest single improvement**
+4. **Multiplicative + learned decay is destructive**: Each works alone but
+   their combination creates unstable gradient interactions
+5. **Wider write context marginal**: Trigrams and multi-write help modestly
+6. **J6 matters at seq=256**: Learned decay with identity gets -1.4% vs -3.5%
+   with J6. At seq=128 J6 doesn't matter, but at seq=256 the geometric
+   structure becomes load-bearing.
+
 **Needs full-data verification at seq=256.**
 
 #### 3g. Gram eigenstructure as features
