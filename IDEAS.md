@@ -286,6 +286,31 @@ Rapid screening (2-layer, 10% data, ROCm):
 and the advantage shrinks. The optimal regime balances d_head≥24 for attention
 quality with enough heads for timescale diversity.
 
+**Model width scaling (2 layers, 8 heads, seq=256, rapid 10% data):**
+
+| d_model | Standard | Learned decay | Delta |
+|---------|----------|---------------|-------|
+| 128* | ~3184 | ~3074 | -3.5% |
+| 192 | 1777.5 | 1687.5 | -5.1% |
+| 256 | 1318.3 | 1232.5 | **-6.5%** |
+
+*4 heads (fast model)
+
+**The geometry advantage grows with model width.** Wider models have more
+capacity to exploit the complementary geometric signal. This suggests the
+Gram provides genuinely useful information that standard attention alone
+cannot compute — and more model capacity means more ability to use it.
+
+**Depth scaling (d=192, 8 heads):**
+
+| Layers | Standard | Learned decay | Delta |
+|--------|----------|---------------|-------|
+| 2 | 1777.5 | 1687.5 | -5.1% |
+| 4 | 1731.3 | 1673.3 | -3.3% |
+
+Deeper models show smaller advantage — they already capture structural
+information through their multiple attention layers.
+
 **Needs full-data verification at seq=256.**
 
 #### 3g. Gram eigenstructure as features
