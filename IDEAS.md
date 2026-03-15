@@ -271,6 +271,21 @@ Rapid screening (2-layer, 10% data, ROCm):
    with J6. At seq=128 J6 doesn't matter, but at seq=256 the geometric
    structure becomes load-bearing.
 
+**Head count scaling (d=192, 2 layers, seq=256, rapid 10% data):**
+
+| Heads | d_head | Standard | Learned decay | Delta |
+|-------|--------|----------|---------------|-------|
+| 4 | 32* | ~3184 | ~3074 | -3.5% |
+| 6 | 32 | 1730.8 | 1676.6 | -3.1% |
+| **8** | **24** | **1777.5** | **1687.5** | **-5.1%** |
+| 12 | 16 | 1748.7 | 1693.9 | -3.1% |
+
+*d=128 fast model
+
+8 heads is the sweet spot. At 12 heads (d_head=16), attention quality degrades
+and the advantage shrinks. The optimal regime balances d_head≥24 for attention
+quality with enough heads for timescale diversity.
+
 **Needs full-data verification at seq=256.**
 
 #### 3g. Gram eigenstructure as features
