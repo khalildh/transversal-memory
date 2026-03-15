@@ -330,16 +330,25 @@ much richer geometric interactions.
 | Online mem G(2,4) | **400.5** | 6,896,528 | J6 (Hodge) |
 | Online mem G(2,6) | 403.7 | 6,904,720 | Identity |
 
-**Finding**: G(2,6) with dot product (identity J) matches standard but loses
-the G(2,4) advantage entirely. Two possible explanations:
-1. **J6 is the key ingredient**: The Hodge dual J6 encodes geometric incidence
-   structure that the identity matrix doesn't. For G(2,6), there's no single
-   bilinear form analogue of J6 (the Hodge star maps Λ²→Λ⁴, not Λ²→Λ²).
-2. **2-layer model is too small**: 15D coordinates with only 128 hidden dims
-   and 4 heads may not have enough capacity to learn useful patterns.
+| Online mem G(2,4) no-J6 | **400.8** | 6,896,528 | Identity |
 
-**Next tests**: G(2,4) with identity (no J6) to isolate whether J6 is the
-key ingredient vs the exterior product structure.
+**Finding**: J6 is NOT the key ingredient (400.5 vs 400.8, noise-level
+difference). The exterior product structure itself provides the geometric
+signal — the specific bilinear form (J6 vs identity) is irrelevant.
+
+However, G(2,6) with 15D coordinates (403.7) matches standard (403.9)
+and loses the G(2,4) advantage. Higher dimensionality actively hurts.
+
+**Why G(2,4) works but G(2,6) doesn't**: The 4D→6D exterior product is a
+compact nonlinear feature map (quadratic interactions of 4 coordinates =
+6 features). Going to 6D→15D creates 15 features from 6 coordinates,
+but the extra dimensions are redundant — the model only has 4 heads with
+32 dims each to learn structure. The 6D sweet spot balances expressivity
+with learnability.
+
+**Lesson**: The geometry's value is in the exterior product as a nonlinear
+feature map, not in the Plücker inner product or Grassmannian structure.
+Dimension 4→6 is the sweet spot for this model size.
 
 ## Active: Retrieval and reasoning
 

@@ -450,9 +450,11 @@ def load_tokens_cached(split, cfg):
     _token_cache[split] = tokens
     return tokens
 
-def make_batches(data, seq_len, batch_size):
+def make_batches(data, seq_len, batch_size, data_frac=1.0):
     n = len(data) - 1
     n_seqs = (n // seq_len // batch_size) * batch_size
+    if data_frac < 1.0:
+        n_seqs = max(batch_size, int(n_seqs * data_frac) // batch_size * batch_size)
     data = data[:n_seqs * seq_len + 1]
     x = data[:-1].reshape(n_seqs, seq_len)
     y = data[1:].reshape(n_seqs, seq_len)
@@ -494,7 +496,7 @@ def get_lr(step, cfg, total_steps):
     progress = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
     return cfg.lr * 0.5 * (1 + math.cos(math.pi * progress))
 
-def train(attn_type, cfg, device, from_checkpoint=True, **kw):
+def train(attn_type, cfg, device, from_checkpoint=True, data_frac=1.0, **kw):
     enc = tiktoken.get_encoding("gpt2")
     train_data = load_tokens_cached("train", cfg)
     val_data = load_tokens_cached("val", cfg)
@@ -511,7 +513,7 @@ def train(attn_type, cfg, device, from_checkpoint=True, **kw):
             print(f"  Fine-tuning for {cfg.n_epochs} epochs (lr={cfg.lr})")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.01)
-    n_batches = len(make_batches(train_data, cfg.seq_len, cfg.batch_size))
+    n_batches = len(make_batches(train_data, cfg.seq_len, cfg.batch_size, data_frac))
     total_steps = n_batches * cfg.n_epochs
 
     losses, ppls = [], []
@@ -522,7 +524,7 @@ def train(attn_type, cfg, device, from_checkpoint=True, **kw):
     for ep in range(cfg.n_epochs):
         t0 = time.time()
         model.train()
-        batches = make_batches(train_data, cfg.seq_len, cfg.batch_size)
+        batches = make_batches(train_data, cfg.seq_len, cfg.batch_size, data_frac)
         ep_loss = 0.0
         for xb, yb in batches:
             lr = get_lr(global_step, cfg, total_steps)
@@ -599,6 +601,7 @@ def main():
     parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length")
     parser.add_argument("--point-dim", type=int, default=4, help="Point dimension (4=6D Plücker, 5=10D, 6=15D)")
     parser.add_argument("--no-j", action="store_true", help="Use identity instead of J6 for G(2,4)")
+    parser.add_argument("--data-frac", type=float, default=1.0, help="Fraction of training data (e.g. 0.1 for 10%%)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -623,21 +626,24 @@ def main():
     _, plucker_dim = make_plucker_pairs(args.point_dim)
     j_label = "J6" if (args.point_dim == 4 and use_j) else "identity"
 
+    frac_label = f" data_frac={args.data_frac}" if args.data_frac < 1.0 else ""
     print(f"{'='*60}")
     print(f"  {args.variant} | bs={cfg.batch_size} seq={cfg.seq_len} layers={cfg.n_layers}")
-    print(f"  point_dim={args.point_dim} plucker_dim={plucker_dim} J={j_label}")
+    print(f"  point_dim={args.point_dim} plucker_dim={plucker_dim} J={j_label}{frac_label}")
     print(f"  from_checkpoint={not args.from_scratch}")
     print(f"{'='*60}")
 
     # Train baseline if requested
     if args.baseline:
         print("\n  Training standard baseline...")
-        std, _, std_p = train("standard", cfg, device, from_checkpoint=False)
+        std, _, std_p = train("standard", cfg, device, from_checkpoint=False,
+                              data_frac=args.data_frac)
         print(f"  Standard baseline: PPL {min(std_p):.1f}")
 
     # Train variant
     var, _, var_p = train(args.variant, cfg, device,
-                          from_checkpoint=not args.from_scratch, **kw)
+                          from_checkpoint=not args.from_scratch,
+                          data_frac=args.data_frac, **kw)
 
     # Results
     print(f"\n{'='*60}")
