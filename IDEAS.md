@@ -312,7 +312,7 @@ for queries, then the real forward with recalled values). This doubles
 compute when reading is active. Could optimize by caching write lines
 from the previous batch instead.
 
-### 4. Higher Grassmannian attention
+### 4. Higher Grassmannian attention ← TESTED, negative (fast screening)
 
 Use G(2,6) with 15D Plücker coordinates instead of G(2,4) with 6D. The higher
 Grassmannian provides more geometric room for discrimination (demonstrated by
@@ -321,6 +321,25 @@ attention mechanism would use 15D incidence instead of 6D.
 
 Trade-off: more parameters per head (15D vs 6D coordinates), but potentially
 much richer geometric interactions.
+
+**Fast 2-layer screening (10 epochs, from scratch, ROCm AMD 8060S):**
+
+| Model | Best PPL | Params | J matrix |
+|-------|----------|--------|----------|
+| Standard (no geometry) | 403.9 | 6,846,080 | — |
+| Online mem G(2,4) | **400.5** | 6,896,528 | J6 (Hodge) |
+| Online mem G(2,6) | 403.7 | 6,904,720 | Identity |
+
+**Finding**: G(2,6) with dot product (identity J) matches standard but loses
+the G(2,4) advantage entirely. Two possible explanations:
+1. **J6 is the key ingredient**: The Hodge dual J6 encodes geometric incidence
+   structure that the identity matrix doesn't. For G(2,6), there's no single
+   bilinear form analogue of J6 (the Hodge star maps Λ²→Λ⁴, not Λ²→Λ²).
+2. **2-layer model is too small**: 15D coordinates with only 128 hidden dims
+   and 4 heads may not have enough capacity to learn useful patterns.
+
+**Next tests**: G(2,4) with identity (no J6) to isolate whether J6 is the
+key ingredient vs the exterior product structure.
 
 ## Active: Retrieval and reasoning
 

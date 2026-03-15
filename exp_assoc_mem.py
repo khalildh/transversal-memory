@@ -24,6 +24,9 @@ Usage:
   uv run python exp_assoc_mem.py --baseline --from-scratch
 """
 
+import os
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,7 +40,7 @@ import argparse
 from pathlib import Path
 from itertools import combinations
 
-sys.path.insert(0, "/Volumes/PRO-G40/Code/TDGA/src")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -68,85 +71,56 @@ class Config:
 class BatchedTriadicMemory:
     """Triadic associative memory with batched GPU queries.
 
-    Stores (key, layer, value) triples as indicator matrices.
-    Supports querying many keys at once via batched matrix multiplies.
+    Stores (key, layer, value) triples as dense binary indicator rows.
+    All operations stay on GPU — no CPU round-trips.
     """
 
     def __init__(self, N, P, device="cpu"):
         self.N = N
         self.P = P
         self.device = torch.device(device)
-        # Indicator matrices: (num_triples, N)
-        self._key_rows = []
-        self._layer_rows = []
-        self._val_rows = []
-        # Materialized on device
+        # Materialized on device: (n_stored, N) each
         self._key_mat = None
         self._layer_mat = None
         self._val_mat = None
-        self._dirty = False
         self.n_stored = 0
 
-    def store_batch(self, key_sdrs, layer_sdr, val_sdrs):
-        """Store a batch of (key, layer, value) triples.
+    def store_dense(self, key_dense, layer_dense, val_dense):
+        """Store a batch of dense binary SDR rows, all on GPU.
 
-        key_sdrs: list of np.ndarray (sorted indices), one per item
-        layer_sdr: np.ndarray (sorted indices), shared across batch
-        val_sdrs: list of np.ndarray (sorted indices), one per item
+        key_dense: (K, N) float tensor on device
+        layer_dense: (N,) float tensor on device (shared, will be broadcast)
+        val_dense: (K, N) float tensor on device
         """
-        N = self.N
-        layer_row = torch.zeros(N, dtype=torch.float32)
-        layer_row[torch.from_numpy(layer_sdr.astype(np.int64))] = 1.0
+        K = key_dense.shape[0]
+        layer_expanded = layer_dense.unsqueeze(0).expand(K, -1)  # (K, N)
 
-        for key_sdr, val_sdr in zip(key_sdrs, val_sdrs):
-            key_row = torch.zeros(N, dtype=torch.float32)
-            key_row[torch.from_numpy(key_sdr.astype(np.int64))] = 1.0
-            val_row = torch.zeros(N, dtype=torch.float32)
-            val_row[torch.from_numpy(val_sdr.astype(np.int64))] = 1.0
-            self._key_rows.append(key_row)
-            self._layer_rows.append(layer_row)
-            self._val_rows.append(val_row)
-            self.n_stored += 1
-
-        self._dirty = True
-
-    def _rebuild(self):
-        if not self._dirty or not self._key_rows:
-            return
-
-        for attr, buf in [("_key_mat", self._key_rows),
-                          ("_layer_mat", self._layer_rows),
-                          ("_val_mat", self._val_rows)]:
-            new = torch.stack(buf)
+        for attr, new in [("_key_mat", key_dense),
+                          ("_layer_mat", layer_expanded),
+                          ("_val_mat", val_dense)]:
             existing = getattr(self, attr)
             if existing is not None:
-                existing_cpu = existing.cpu() if existing.device.type != "cpu" else existing
-                combined = torch.cat([existing_cpu, new], dim=0)
+                setattr(self, attr, torch.cat([existing, new], dim=0))
             else:
-                combined = new
-            setattr(self, attr, combined.to(self.device))
-            buf.clear()
+                setattr(self, attr, new.clone())
 
-        self._dirty = False
+        self.n_stored += K
 
-    def query_batch(self, key_dense_batch, layer_sdr):
+    def query_batch(self, key_dense_batch, layer_dense):
         """Query with a batch of dense key vectors + shared layer SDR.
 
-        key_dense_batch: (Q, N) float tensor on device — dense SDR representations
-        layer_sdr: np.ndarray of sorted indices
+        key_dense_batch: (Q, N) float tensor on device
+        layer_dense: (N,) float tensor on device
 
         Returns: (Q, N) float tensor — summed votes for each query
         """
-        self._rebuild()
-        if self._key_mat is None or self._key_mat.shape[0] == 0:
+        if self._key_mat is None or self.n_stored == 0:
             return None
 
-        # Layer overlap: (T_stored,) — same for all queries
-        layer_oh = torch.zeros(self.N, dtype=torch.float32, device=self.device)
-        layer_oh[torch.from_numpy(layer_sdr.astype(np.int64)).to(self.device)] = 1.0
-        layer_overlap = self._layer_mat @ layer_oh  # (T_stored,)
+        # Layer overlap: (T_stored,)
+        layer_overlap = self._layer_mat @ layer_dense  # (T_stored,)
 
-        # Key overlap: (Q, T_stored) — batched
+        # Key overlap: (Q, T_stored)
         key_overlap = key_dense_batch @ self._key_mat.T  # (Q, T_stored)
 
         # Combined weights: (Q, T_stored)
@@ -156,11 +130,6 @@ class BatchedTriadicMemory:
         sums = weights @ self._val_mat  # (Q, N)
 
         return sums
-
-    def sums_to_sdrs(self, sums):
-        """Convert vote sums to SDR indices (top-P per query)."""
-        _, topk = torch.topk(sums, self.P, dim=-1)
-        return topk  # (Q, P) — indices on device
 
 
 # ── SDR encoding via random projection ────────────────────────────────────────
@@ -446,12 +415,14 @@ class AssocMemoryManager:
             cfg.d_model, n=cfg.sdr_n, p=cfg.sdr_p, seed=200
         ).to_device(device)
 
-        # Fixed layer SDRs
+        # Fixed layer SDRs as dense GPU tensors
         rng = np.random.default_rng(300)
-        self.layer_sdrs = [
-            np.sort(rng.permutation(cfg.sdr_n)[:cfg.sdr_p]).astype(np.uint32)
-            for _ in range(cfg.n_layers)
-        ]
+        self.layer_dense = []
+        for _ in range(cfg.n_layers):
+            indices = rng.permutation(cfg.sdr_n)[:cfg.sdr_p]
+            dense = torch.zeros(cfg.sdr_n, dtype=torch.float32, device=device)
+            dense[torch.from_numpy(indices.astype(np.int64)).to(device)] = 1.0
+            self.layer_dense.append(dense)
 
         # One triadic memory per layer (keeps them separate, faster queries)
         self.memories = [
@@ -460,7 +431,7 @@ class AssocMemoryManager:
         ]
 
     def write(self, write_lines_per_layer, hidden_states_per_layer, interval=8):
-        """Write to associative memory from cached write lines + hidden states.
+        """Write to associative memory — fully on GPU, no CPU round-trips.
 
         Subsamples positions by interval to control memory growth.
         write_lines_per_layer: list of (B, T, H, 6) tensors
@@ -477,30 +448,25 @@ class AssocMemoryManager:
             # Flatten write lines per position: (B, T, H*6)
             wl_flat = wl.reshape(B, T, H * 6)
 
-            # Subsample positions
+            # Subsample positions and gather all at once
             positions = list(range(0, T, interval))
             if not positions:
                 continue
 
-            for pos in positions:
-                # Encode keys for all batch items at this position
-                keys_at_pos = wl_flat[:, pos, :]  # (B, H*6)
-                vals_at_pos = hs[:, pos, :]  # (B, D)
+            pos_idx = torch.tensor(positions, device=wl.device)
+            # (B, n_pos, H*6) → (B*n_pos, H*6)
+            keys_sub = wl_flat[:, pos_idx, :].reshape(-1, H * 6)
+            vals_sub = hs[:, pos_idx, :].reshape(-1, self.cfg.d_model)
 
-                # Encode as SDRs (numpy, one at a time for now)
-                key_sdrs = []
-                val_sdrs = []
-                for b in range(B):
-                    key_sdrs.append(self.key_encoder.encode_single(
-                        keys_at_pos[b].cpu().numpy()))
-                    val_sdrs.append(self.val_encoder.encode_single(
-                        vals_at_pos[b].cpu().numpy()))
+            # Encode to dense SDRs on GPU: (B*n_pos, N)
+            key_dense = self.key_encoder.encode_batch_dense(keys_sub.float())
+            val_dense = self.val_encoder.encode_batch_dense(vals_sub.float())
 
-                self.memories[layer_idx].store_batch(
-                    key_sdrs, self.layer_sdrs[layer_idx], val_sdrs)
+            self.memories[layer_idx].store_dense(
+                key_dense, self.layer_dense[layer_idx], val_dense)
 
     def read(self, write_lines_per_layer):
-        """Read from associative memory for all positions.
+        """Read from associative memory — fully on GPU.
 
         Returns list of (B, T, D) tensors per layer — recalled values.
         """
@@ -518,19 +484,17 @@ class AssocMemoryManager:
 
             # Encode all positions as dense SDR keys: (B*T, N)
             wl_2d = wl_flat.reshape(B * T, H * 6)
-            key_dense = self.key_encoder.encode_batch_dense(wl_2d)  # (B*T, N)
+            key_dense = self.key_encoder.encode_batch_dense(wl_2d.float())
 
             # Batched query: (B*T, N) → (B*T, N) vote sums
-            vote_sums = mem.query_batch(key_dense, self.layer_sdrs[layer_idx])
+            vote_sums = mem.query_batch(key_dense, self.layer_dense[layer_idx])
 
             if vote_sums is None:
                 results.append(None)
                 continue
 
             # Decode votes back to value space: (B*T, N) → (B*T, D)
-            # Use top-P to get SDR, then decode
-            # But we can also decode directly from the soft votes (smoother)
-            recalled_vals = self.val_encoder.decode_batch(vote_sums)  # (B*T, D)
+            recalled_vals = self.val_encoder.decode_batch(vote_sums)
 
             # Normalize to prevent scale explosion
             recalled_vals = recalled_vals / (recalled_vals.norm(dim=-1, keepdim=True).clamp(min=1e-8))
@@ -598,6 +562,13 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
     model = LM(enc.n_vocab, cfg, attn_cls, **kw).to(device)
     print(f"\n  {label}: {model.count_params():,} params")
 
+    # ROCm / CUDA optimizations
+    use_amp = device.type == "cuda"
+    if use_amp:
+        print(f"    Using AMP (bfloat16) + torch.compile")
+        model = torch.compile(model)
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+
     assoc = AssocMemoryManager(cfg, device) if use_assoc else None
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.01)
@@ -626,7 +597,7 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
             # Read from associative memory (if enabled and past warmup)
             assoc_values = None
             if use_assoc and assoc is not None and ep >= cfg.mem_start_epoch:
-                with torch.no_grad():
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                     # Need write lines from current input to form queries
                     # Do a no-grad forward to get write lines
                     _ = model(xb)
@@ -636,8 +607,9 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
                         read_batches += 1
 
             # Forward with optional associative memory values
-            logits = model(xb, assoc_values_per_layer=assoc_values)
-            loss = F.cross_entropy(logits.view(-1, enc.n_vocab), yb.view(-1))
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                logits = model(xb, assoc_values_per_layer=assoc_values)
+                loss = F.cross_entropy(logits.view(-1, enc.n_vocab), yb.view(-1))
 
             opt.zero_grad()
             loss.backward()
@@ -660,7 +632,7 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
 
         # Validation (without assoc memory for fair comparison)
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             vb = make_batches(val_data, cfg.seq_len, cfg.batch_size)
             vl = sum(F.cross_entropy(model(x.to(device)).view(-1, enc.n_vocab),
                      y.to(device).view(-1)).item() for x, y in vb) / len(vb)
@@ -686,7 +658,7 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
     # Evaluate WITH assoc memory on val set
     if use_assoc and assoc is not None and assoc.total_stored > 0:
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             vb = make_batches(val_data, cfg.seq_len, cfg.batch_size)
             assoc_losses = []
             for x, y in vb:
@@ -721,7 +693,7 @@ def main():
     parser.add_argument("--decay", type=float, default=0.99)
     args = parser.parse_args()
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     cfg = Config()
     cfg.n_epochs = args.epochs
     cfg.decay = args.decay

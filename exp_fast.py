@@ -16,7 +16,11 @@ Usage:
   python exp_fast.py dual_path --from-scratch  # train from scratch (no checkpoint init)
   python exp_fast.py dual_path --fast       # 2-layer screening model (~1 min)
   python exp_fast.py dual_path --baseline   # also train standard baseline
+  python exp_fast.py online_mem --point-dim 6  # G(2,6) with 15D Plücker coords
 """
+
+import os
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
 
 import torch
 import torch.nn as nn
@@ -97,7 +101,7 @@ class StandardAttention(nn.Module):
 
 class OnlineMemoryAttention(nn.Module):
     """Current best: scalar Gram energy gate."""
-    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, **kw):
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, use_j=True, **kw):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
@@ -116,8 +120,8 @@ class OnlineMemoryAttention(nn.Module):
         self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
         self.out = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
-        # Use identity for higher dims (model learns structure via projections)
-        if point_dim == 4:
+        # J6 Hodge dual for G(2,4); identity (dot product) for higher dims or --no-j
+        if point_dim == 4 and use_j:
             self.register_buffer('J', _J6)
         else:
             self.register_buffer('J', torch.eye(self.plucker_dim))
@@ -186,7 +190,7 @@ class MultiScaleMemoryAttention(nn.Module):
     Inspired by Grassmann Flows (Dec 2025) multi-resolution approach.
     """
     def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4,
-                 offsets=(1, 2, 4, 8), **kw):
+                 offsets=(1, 2, 4, 8), use_j=True, **kw):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
@@ -207,7 +211,7 @@ class MultiScaleMemoryAttention(nn.Module):
         self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
         self.out = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
-        if point_dim == 4:
+        if point_dim == 4 and use_j:
             self.register_buffer('J', _J6)
         else:
             self.register_buffer('J', torch.eye(self.plucker_dim))
@@ -594,9 +598,10 @@ def main():
     parser.add_argument("--decay", type=float, default=0.99, help="Memory decay rate")
     parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length")
     parser.add_argument("--point-dim", type=int, default=4, help="Point dimension (4=6D Plücker, 5=10D, 6=15D)")
+    parser.add_argument("--no-j", action="store_true", help="Use identity instead of J6 for G(2,4)")
     args = parser.parse_args()
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     cfg = Config()
 
     if args.fast:
@@ -613,12 +618,14 @@ def main():
     if args.epochs:
         cfg.n_epochs = args.epochs
 
-    kw = {"decay": args.decay, "point_dim": args.point_dim}
+    use_j = not args.no_j
+    kw = {"decay": args.decay, "point_dim": args.point_dim, "use_j": use_j}
     _, plucker_dim = make_plucker_pairs(args.point_dim)
+    j_label = "J6" if (args.point_dim == 4 and use_j) else "identity"
 
     print(f"{'='*60}")
     print(f"  {args.variant} | bs={cfg.batch_size} seq={cfg.seq_len} layers={cfg.n_layers}")
-    print(f"  point_dim={args.point_dim} plucker_dim={plucker_dim}")
+    print(f"  point_dim={args.point_dim} plucker_dim={plucker_dim} J={j_label}")
     print(f"  from_checkpoint={not args.from_scratch}")
     print(f"{'='*60}")
 
