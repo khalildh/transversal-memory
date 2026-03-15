@@ -416,59 +416,90 @@ def get_lr(step, cfg, total_steps):
 
 # ── Training with triadic seeding ────────────────────────────────────────────
 
-def extract_and_store_grams(model, xb, ctx_vec, store, device):
-    """Extract Gram matrices from cached write lines and store in triadic memory."""
+def extract_and_store_grams(model, xb, ctx_vec, store, device, per_seq=False,
+                            subsample_rate=0.25, rng=None):
+    """Extract Gram matrices from cached write lines and store in triadic memory.
+
+    per_seq=False: store batch-averaged Grams (1 triple per layer per batch)
+    per_seq=True:  store per-sequence Grams (subsampled to reduce memory)
+    """
     write_lines_per_layer = model.get_cached_write_lines()
+    B = xb.shape[0]
 
-    # Batch-average context vector (single representative per batch)
-    ctx_avg = ctx_vec.mean(dim=0).cpu().numpy()  # (d_model,)
+    if per_seq:
+        # Subsample sequences to keep memory manageable
+        n_store = max(1, int(B * subsample_rate))
+        if rng is None:
+            rng = np.random.default_rng()
+        indices = rng.choice(B, size=n_store, replace=False)
 
-    for layer_idx, wl in enumerate(write_lines_per_layer):
-        if wl is None:
-            continue
-        # wl: (B, T, H, 6) — compute Gram per head, average over batch
-        # Gram = sum_t write_t outer write_t → (B, H, 6, 6)
-        gram = torch.einsum('bthi,bthj->bhij', wl, wl)  # (B, H, 6, 6)
-        # Batch average
-        gram_avg = gram.mean(dim=0)  # (H, 6, 6)
-        gram_flat = gram_avg.cpu().numpy().flatten()  # (H*36,)
-        store.store(ctx_avg, gram_flat, layer_idx)
+        ctx_np = ctx_vec.cpu().numpy()  # (B, d_model)
+        for layer_idx, wl in enumerate(write_lines_per_layer):
+            if wl is None:
+                continue
+            gram = torch.einsum('bthi,bthj->bhij', wl, wl)  # (B, H, 6, 6)
+            gram_np = gram.cpu().numpy()
+            for idx in indices:
+                store.store(ctx_np[idx], gram_np[idx].flatten(), layer_idx)
+    else:
+        # Batch-average (original approach)
+        ctx_avg = ctx_vec.mean(dim=0).cpu().numpy()
+        for layer_idx, wl in enumerate(write_lines_per_layer):
+            if wl is None:
+                continue
+            gram = torch.einsum('bthi,bthj->bhij', wl, wl)
+            gram_avg = gram.mean(dim=0)
+            gram_flat = gram_avg.cpu().numpy().flatten()
+            store.store(ctx_avg, gram_flat, layer_idx)
 
 
-def recall_gram_seeds(model, xb, store, cfg, device):
+def recall_gram_seeds(model, xb, store, cfg, device, per_seq=False):
     """Recall Gram seeds from triadic memory for the current batch."""
     if store.n_stored == 0:
         return None
 
-    # Context from first K token embeddings (batch average)
     ctx_vec = model.get_context_embedding(xb, cfg.ctx_warmup)
-    ctx_avg = ctx_vec.mean(dim=0).cpu().numpy()
 
-    gram_seeds = []
-    for layer_idx in range(cfg.n_layers):
-        recalled = store.recall(ctx_avg, layer_idx)
-        if recalled is not None:
-            # Reshape from flat (H*36,) to (H, 6, 6)
-            g = torch.tensor(recalled, dtype=torch.float32).reshape(cfg.n_heads, 6, 6)
-            # Symmetrize for stability
-            g = (g + g.transpose(-1, -2)) / 2
-            # Broadcast to batch: (1, H, 6, 6) → (B, H, 6, 6) via broadcasting
-            gram_seeds.append(g.unsqueeze(0).expand(xb.shape[0], -1, -1, -1).to(device))
-        else:
-            gram_seeds.append(None)
+    if per_seq:
+        # Per-sequence recall: each sequence in batch gets its own recalled Gram
+        ctx_np = ctx_vec.cpu().numpy()  # (B, d_model)
+        B = xb.shape[0]
+        gram_seeds = []
+        for layer_idx in range(cfg.n_layers):
+            layer_grams = []
+            for b in range(B):
+                recalled = store.recall(ctx_np[b], layer_idx)
+                if recalled is not None:
+                    g = torch.tensor(recalled, dtype=torch.float32).reshape(cfg.n_heads, 6, 6)
+                    g = (g + g.transpose(-1, -2)) / 2
+                    layer_grams.append(g)
+                else:
+                    layer_grams.append(torch.zeros(cfg.n_heads, 6, 6))
+            gram_seeds.append(torch.stack(layer_grams).to(device))
+        return gram_seeds
+    else:
+        # Batch-average recall (original approach)
+        ctx_avg = ctx_vec.mean(dim=0).cpu().numpy()
+        gram_seeds = []
+        for layer_idx in range(cfg.n_layers):
+            recalled = store.recall(ctx_avg, layer_idx)
+            if recalled is not None:
+                g = torch.tensor(recalled, dtype=torch.float32).reshape(cfg.n_heads, 6, 6)
+                g = (g + g.transpose(-1, -2)) / 2
+                gram_seeds.append(g.unsqueeze(0).expand(xb.shape[0], -1, -1, -1).to(device))
+            else:
+                gram_seeds.append(None)
 
-    # If all layers returned None, return None
-    if all(g is None for g in gram_seeds):
-        return None
-    # Replace None with zeros
-    for i in range(len(gram_seeds)):
-        if gram_seeds[i] is None:
-            gram_seeds[i] = torch.zeros(xb.shape[0], cfg.n_heads, 6, 6, device=device)
-
-    return gram_seeds
+        if all(g is None for g in gram_seeds):
+            return None
+        for i in range(len(gram_seeds)):
+            if gram_seeds[i] is None:
+                gram_seeds[i] = torch.zeros(xb.shape[0], cfg.n_heads, 6, 6, device=device)
+        return gram_seeds
 
 
-def train_model(cfg, device, use_seed=True, from_checkpoint=True, label="triadic_seed"):
+def train_model(cfg, device, use_seed=True, from_checkpoint=True, label="triadic_seed",
+                per_seq=False):
     """Train with optional triadic seeding."""
     enc = tiktoken.get_encoding("gpt2")
     train_data = load_tokens_cached("train", cfg)
@@ -497,6 +528,7 @@ def train_model(cfg, device, use_seed=True, from_checkpoint=True, label="triadic
         cfg_train = cfg
 
     store = TriadicGramStore(cfg) if use_seed else None
+    store_rng = np.random.default_rng(42)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg_train.lr, weight_decay=0.01)
     n_batches = len(make_batches(train_data, cfg.seq_len, cfg.batch_size))
@@ -524,7 +556,8 @@ def train_model(cfg, device, use_seed=True, from_checkpoint=True, label="triadic
             # Recall gram seeds (if triadic seeding enabled and past warmup epoch)
             gram_seeds = None
             if use_seed and store is not None and ep >= cfg.seed_start_epoch:
-                gram_seeds = recall_gram_seeds(model, xb, store, cfg, device)
+                gram_seeds = recall_gram_seeds(model, xb, store, cfg, device,
+                                               per_seq=per_seq)
                 if gram_seeds is not None:
                     seeded_batches += 1
 
@@ -543,7 +576,8 @@ def train_model(cfg, device, use_seed=True, from_checkpoint=True, label="triadic
             if use_seed and store is not None:
                 with torch.no_grad():
                     ctx_vec = model.get_context_embedding(xb, cfg.ctx_warmup)
-                    extract_and_store_grams(model, xb, ctx_vec, store, device)
+                    extract_and_store_grams(model, xb, ctx_vec, store, device,
+                                            per_seq=per_seq, rng=store_rng)
 
         avg = ep_loss / len(batches)
         losses.append(avg)
@@ -581,7 +615,8 @@ def train_model(cfg, device, use_seed=True, from_checkpoint=True, label="triadic
             seeded_losses = []
             for x, y in vb:
                 x, y = x.to(device), y.to(device)
-                gs = recall_gram_seeds(model, x, store, cfg, device)
+                gs = recall_gram_seeds(model, x, store, cfg, device,
+                                       per_seq=per_seq)
                 vl = F.cross_entropy(model(x, gram_seeds=gs).view(-1, enc.n_vocab),
                                      y.view(-1)).item()
                 seeded_losses.append(vl)
@@ -611,6 +646,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--decay", type=float, default=0.99)
     parser.add_argument("--seed-start", type=int, default=1, help="Epoch to start seeding (0-indexed)")
+    parser.add_argument("--per-seq", action="store_true", help="Per-sequence storage (sharper topic signal)")
+    parser.add_argument("--bs", type=int, default=None, help="Override batch size")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -619,11 +656,18 @@ def main():
     cfg.decay = args.decay
     cfg.seed_start_epoch = args.seed_start
 
+    if args.bs:
+        cfg.batch_size = args.bs
+
     if args.fast:
         cfg.n_layers = 2
         cfg.d_model = 128
         cfg.n_heads = 4
         print("  FAST MODE: 2 layers, d=128, 4 heads")
+    else:
+        # 4-layer model is much slower at bs=128; default to 64
+        if cfg.batch_size > 64:
+            cfg.batch_size = 64
 
     print(f"{'='*60}")
     print(f"  Triadic-Seeded Online Gram Memory LM")
@@ -631,6 +675,7 @@ def main():
     print(f"  seq={cfg.seq_len} bs={cfg.batch_size} epochs={cfg.n_epochs}")
     print(f"  decay={cfg.decay} seed_start_epoch={cfg.seed_start_epoch}")
     print(f"  SDR: N={cfg.sdr_n} P={cfg.sdr_p}")
+    print(f"  per_seq={args.per_seq}")
     print(f"{'='*60}")
 
     if args.no_seed or args.baseline:
@@ -644,7 +689,8 @@ def main():
         print("\n  Training triadic-seeded online_mem...")
         _, _, seed_ppls, store = train_model(cfg, device, use_seed=True,
                                               from_checkpoint=not args.from_scratch,
-                                              label="triadic_seed")
+                                              label="triadic_seed",
+                                              per_seq=args.per_seq)
         print(f"\n  Triadic-seeded: PPL {min(seed_ppls):.1f}")
         if store:
             print(f"  Triadic memory: {store.n_stored} triples stored")

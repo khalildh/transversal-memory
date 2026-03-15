@@ -151,10 +151,17 @@ Fast screening (2-layer, 7 epochs, from scratch):
 - Triadic-seeded:       PPL 485.2 (2.0% better)
 - Seeded vs non-seeded eval: identical (485.2 both)
 
-**Key finding**: Seeding improves *training* convergence but not *inference*.
-The Gram seeds act as structural regularization during training — the model
-learns better weights because it gets relational priors from triadic memory.
-But at inference time, the learned weights already internalize that knowledge.
+Full model (4-layer, 10 epochs, from scratch, bs=64):
+- Online mem (no seed): PPL 242.7
+- Triadic-seeded:       PPL 244.0 (0.5% worse)
+- Seeded vs non-seeded eval: identical (244.0 vs 244.2)
+- Overhead: 92s → 128s/epoch as triadic memory grew to 11,640 triples
+
+**Key findings**:
+1. Seeding helped the 2-layer model but hurt the 4-layer model
+2. The 4-layer model is expressive enough to learn its own structural priors
+3. Batch-averaged context + Gram is too coarse — all topics blur together
+4. Seeded eval never helps — the learned weights already capture the signal
 
 **Optimization ideas to test:**
 1. **Per-sequence storage** (not batch-averaged): current approach averages
