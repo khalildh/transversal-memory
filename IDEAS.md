@@ -133,14 +133,60 @@ signal. λ=0.99 (half-life ≈ 69 tokens) is the sweet spot, but the advantage
 still shrinks from 3.3% → 0.8% going 128 → 256 tokens. The real bottleneck
 is the 6D Gram space saturating, not the temporal weighting.
 
-#### 3e. Multi-scale memory
+#### 3e. Triadic-seeded Gram memory ← TESTING
+
+**Status: fast screening shows +2% improvement (494.8 → 485.2 PPL, 2-layer)**
+
+Two-tier memory: online Gram accumulation (within-sequence) + triadic
+associative memory (cross-sequence persistent storage). At end of each
+128-token sequence, the accumulated Gram is encoded as an SDR via random
+projection and stored as (context_SDR, layer_SDR, gram_SDR) in triadic
+memory. At start of next sequence, context from first 16 token embeddings
+is used to recall the closest matching Gram, which seeds M₀.
+
+Implementation: `exp_triadic_seed.py`
+
+Fast screening (2-layer, 7 epochs, from scratch):
+- Online mem (no seed): PPL 494.8
+- Triadic-seeded:       PPL 485.2 (2.0% better)
+- Seeded vs non-seeded eval: identical (485.2 both)
+
+**Key finding**: Seeding improves *training* convergence but not *inference*.
+The Gram seeds act as structural regularization during training — the model
+learns better weights because it gets relational priors from triadic memory.
+But at inference time, the learned weights already internalize that knowledge.
+
+**Optimization ideas to test:**
+1. **Per-sequence storage** (not batch-averaged): current approach averages
+   context across 128 sequences in a batch, losing topic signal. Store each
+   sequence individually for sharper topic recall. Risk: memory grows 128x.
+   Mitigation: subsample 25% of sequences.
+2. **Contiguous sequence ordering**: WikiText is article-structured. Process
+   sequences in order (no shuffle) so consecutive sequences share topic.
+   Triadic recall should be strongest when the context actually repeats.
+3. **Multi-scale write lines**: Grassmann Flows uses offsets {1,2,4,8,12,16}
+   instead of just bigrams (offset=1). This gives the Gram richer structure.
+   Easy to add — just loop over offsets in the write line computation.
+4. **Larger SDR space**: N=10000, P=100 for better reconstruction fidelity
+   (current cos=0.795 is lossy). Trade-off: slower triadic query.
+5. **Seed at inference too**: Instead of training-only benefit, build triadic
+   memory from training data, then seed during validation. Need separate
+   context computation (first 16 tokens of val sequences).
+6. **Gradient through seed**: Currently frozen retrieval. Use straight-through
+   estimator to let gradients flow through the recalled Gram → teach the
+   model to use the seed signal more effectively.
+7. **Contrastive seed loss**: Add auxiliary loss that encourages the model's
+   online Gram at position T to be close to the recalled seed Gram. This
+   regularizes the Gram space to be consistent across related sequences.
+
+#### 3f. Multi-scale memory
 
 Run two parallel Gram memories with different decay rates: fast (λ=0.95,
 sentence-level) and slow (λ=0.999, document-level). Different heads could
 read from different timescales. This lets the model capture both local
 syntactic patterns and global topic structure.
 
-#### 3f. Gram eigenstructure as features
+#### 3g. Gram eigenstructure as features
 
 Instead of scoring read lines against the full Gram matrix, extract the
 top-k eigenvectors of M_t and use them as additional "memory keys" that
@@ -149,7 +195,16 @@ axes directly to the attention mechanism.
 
 More complex to implement (differentiable eigendecomposition needed).
 
-#### 3g. Dual-pathway incidence attention ← TESTED, negative
+#### 3h. Multi-scale write lines (from Grassmann Flows)
+
+Instead of only pairing consecutive tokens (offset=1), pair at offsets
+{1, 2, 4, 8}. Each offset produces write lines that capture structure
+at different timescales. All offsets accumulate into the same Gram.
+This is the one useful idea from the Grassmann Flows paper (Dec 2025).
+
+Easy to implement: loop over offsets in the write line computation.
+
+#### 3i. Dual-pathway incidence attention ← TESTED, negative
 
 **Status: tested, PPL 372 from scratch (1.8x worse than standard)**
 
