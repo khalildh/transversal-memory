@@ -1600,6 +1600,9 @@ def main():
     parser.add_argument("--point-dim", type=int, default=4, help="Point dimension (4=6D Plücker, 5=10D, 6=15D)")
     parser.add_argument("--no-j", action="store_true", help="Use identity instead of J6 for G(2,4)")
     parser.add_argument("--data-frac", type=float, default=1.0, help="Fraction of training data (e.g. 0.1 for 10%%)")
+    parser.add_argument("--d-model", type=int, default=None, help="Override d_model")
+    parser.add_argument("--heads", type=int, default=None, help="Override n_heads")
+    parser.add_argument("--layers", type=int, default=None, help="Override n_layers")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -1610,6 +1613,13 @@ def main():
         cfg.d_model = 128
         cfg.n_heads = 4
         print("  FAST MODE: 2 layers, d=128, 4 heads")
+
+    if args.d_model:
+        cfg.d_model = args.d_model
+    if args.heads:
+        cfg.n_heads = args.heads
+    if args.layers:
+        cfg.n_layers = args.layers
 
     if args.seq_len:
         cfg.seq_len = args.seq_len
