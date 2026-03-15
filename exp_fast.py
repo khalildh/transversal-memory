@@ -50,17 +50,25 @@ class Config:
 
 # ── Plücker primitives ──────────────────────────────────────────────────────
 
-_PAIRS = list(combinations(range(4), 2))
+_PAIRS4 = list(combinations(range(4), 2))  # 6 pairs for P³
 
 _J6 = torch.tensor([
     [0,0,0,0,0,1],[0,0,0,0,-1,0],[0,0,0,1,0,0],
     [0,0,1,0,0,0],[0,-1,0,0,0,0],[1,0,0,0,0,0],
 ], dtype=torch.float32)
 
-def exterior(p1, p2):
-    parts = [p1[...,i]*p2[...,j] - p1[...,j]*p2[...,i] for i,j in _PAIRS]
+def exterior(p1, p2, pairs=None):
+    if pairs is None:
+        pairs = _PAIRS4
+    parts = [p1[...,i]*p2[...,j] - p1[...,j]*p2[...,i] for i,j in pairs]
     L = torch.stack(parts, dim=-1)
     return L / L.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+
+def make_plucker_pairs(point_dim):
+    """Return pairs and dimensions for arbitrary Grassmannian G(2, point_dim)."""
+    pairs = list(combinations(range(point_dim), 2))
+    plucker_dim = len(pairs)  # C(point_dim, 2)
+    return pairs, plucker_dim
 
 # ── Attention variants ──────────────────────────────────────────────────────
 
@@ -89,24 +97,30 @@ class StandardAttention(nn.Module):
 
 class OnlineMemoryAttention(nn.Module):
     """Current best: scalar Gram energy gate."""
-    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, **kw):
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, **kw):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.scale = self.d_head ** -0.5
         self.decay = decay
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
 
         self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.W1_write = nn.Linear(d_model, 4 * n_heads, bias=False)
-        self.W2_write = nn.Linear(d_model, 4 * n_heads, bias=False)
-        self.W1_read = nn.Linear(d_model, 4 * n_heads, bias=False)
-        self.W2_read = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
         self.mem_value = nn.Linear(d_model, d_model)
         self.mem_gate = nn.Linear(d_model, n_heads)
         self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
         self.out = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
-        self.register_buffer('J6', _J6)
+        # Use identity for higher dims (model learns structure via projections)
+        if point_dim == 4:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
 
     def forward(self, x):
         B, T, D = x.shape
@@ -121,14 +135,15 @@ class OnlineMemoryAttention(nn.Module):
         seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
 
         x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
-        w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
-        w2 = self.W2_write(x).reshape(B, T, H, 4)
-        write_lines = exterior(w1, w2)
-        r1 = self.W1_read(x).reshape(B, T, H, 4)
-        r2 = self.W2_read(x).reshape(B, T, H, 4)
-        read_lines = exterior(r1, r2)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
 
-        J = self.J6
+        J = self.J
         J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
         read_h = read_lines.permute(0, 2, 1, 3)
         Jwrite_h = J_write.permute(0, 2, 1, 3)
@@ -154,6 +169,107 @@ class OnlineMemoryAttention(nn.Module):
 
         mem_val = self.mem_value(x)
         gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
+class MultiScaleMemoryAttention(nn.Module):
+    """Online Gram memory with multi-scale write lines.
+
+    Instead of only pairing consecutive tokens (offset=1), pairs at
+    offsets {1, 2, 4, 8}. This captures structure at sentence-level
+    (offset=1-2) and paragraph-level (offset=4-8) simultaneously.
+    Inspired by Grassmann Flows (Dec 2025) multi-resolution approach.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4,
+                 offsets=(1, 2, 4, 8), **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+        self.point_dim = point_dim
+        self.offsets = offsets
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        # Shared write/read projections across offsets
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        # Standard attention
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # Multi-scale write lines
+        pd = self.point_dim
+        J = self.J
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+
+        # Read lines (same for all scales)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+        read_h = read_lines.permute(0, 2, 1, 3)  # (B, H, T, plucker_dim)
+
+        # Accumulate incidence scores across offsets
+        total_incidence_sq = torch.zeros(B, H, T, T, device=x.device)
+
+        for offset in self.offsets:
+            # Shift x by offset positions
+            x_past = torch.cat([
+                torch.zeros(B, offset, D, device=x.device),
+                x[:, :-offset]
+            ], dim=1)
+            w1 = self.W1_write(x_past).reshape(B, T, H, pd)
+            w2 = self.W2_write(x).reshape(B, T, H, pd)
+            write_lines = exterior(w1, w2, self.pairs)
+
+            J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+            Jwrite_h = J_write.permute(0, 2, 1, 3)
+            incidence = read_h @ Jwrite_h.transpose(-1, -2)
+            inc_sq = incidence ** 2
+            inc_sq = inc_sq.masked_fill(causal, 0.0)
+            total_incidence_sq = total_incidence_sq + inc_sq
+
+        # Average across offsets
+        total_incidence_sq = total_incidence_sq / len(self.offsets)
+
+        # Temporal decay
+        if self.decay != 1.0:
+            positions = torch.arange(T, device=x.device, dtype=x.dtype)
+            weights = self.decay ** (positions.unsqueeze(1) - positions.unsqueeze(0))
+            weights = weights.tril(diagonal=-1)
+            total_incidence_sq = total_incidence_sq * weights.unsqueeze(0).unsqueeze(0)
+
+        mem_score = total_incidence_sq.sum(dim=-1)  # (B, H, T)
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))
         scale = self.mem_scale.reshape(1, H, 1)
         mem_score_t = mem_score.permute(0, 2, 1)
         gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
@@ -251,6 +367,7 @@ class DualPathAttention(nn.Module):
 ATTN_CLASSES = {
     "standard": StandardAttention,
     "online_mem": OnlineMemoryAttention,
+    "multi_scale": MultiScaleMemoryAttention,
     "dual_path": DualPathAttention,
 }
 
@@ -472,6 +589,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=None, help="Override epoch count")
     parser.add_argument("--decay", type=float, default=0.99, help="Memory decay rate")
     parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length")
+    parser.add_argument("--point-dim", type=int, default=4, help="Point dimension (4=6D Plücker, 5=10D, 6=15D)")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -491,10 +609,12 @@ def main():
     if args.epochs:
         cfg.n_epochs = args.epochs
 
-    kw = {"decay": args.decay}
+    kw = {"decay": args.decay, "point_dim": args.point_dim}
+    _, plucker_dim = make_plucker_pairs(args.point_dim)
 
     print(f"{'='*60}")
     print(f"  {args.variant} | bs={cfg.batch_size} seq={cfg.seq_len} layers={cfg.n_layers}")
+    print(f"  point_dim={args.point_dim} plucker_dim={plucker_dim}")
     print(f"  from_checkpoint={not args.from_scratch}")
     print(f"{'='*60}")
 
