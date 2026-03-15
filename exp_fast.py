@@ -370,6 +370,177 @@ class DualPathAttention(nn.Module):
 
         return self.out(combined)
 
+class DualDecayMemoryAttention(nn.Module):
+    """Online Gram memory with per-head decay rates (Idea 3f).
+
+    Half the heads use fast decay (λ=0.95, sentence-level) and
+    half use slow decay (λ=0.999, document-level). This lets the
+    model capture both local syntax and global topic structure.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, fast_decay=0.95,
+                 slow_decay=0.999, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+        # Per-head decay: first half fast, second half slow
+        n_fast = n_heads // 2
+        decays = [fast_decay] * n_fast + [slow_decay] * (n_heads - n_fast)
+        self.register_buffer('decays', torch.tensor(decays, dtype=torch.float32))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        # Per-head temporal weighting: each head has its own λ
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)  # (T, T)
+        # decays: (H,) → weights: (H, T, T)
+        weights = self.decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)  # causal
+        incidence_sq = incidence_sq * weights.unsqueeze(0)  # (B, H, T, T)
+
+        mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
+class LearnedDecayMemoryAttention(nn.Module):
+    """Online Gram memory with learned per-head decay rates.
+
+    Each head learns its own decay λ_h via sigmoid(raw_param), so
+    the model discovers optimal timescales for each head.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+        # Learned decay: sigmoid(raw) → (0, 1), init near 0.99
+        # sigmoid(4.6) ≈ 0.99
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        # Per-head learned decay
+        decays = torch.sigmoid(self.decay_logits)  # (H,) in (0, 1)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        diffs = positions.unsqueeze(1) - positions.unsqueeze(0)
+        weights = decays.reshape(H, 1, 1) ** diffs.unsqueeze(0)
+        weights = weights * (diffs > 0).float().unsqueeze(0)
+        incidence_sq = incidence_sq * weights.unsqueeze(0)
+
+        mem_score = incidence_sq.sum(dim=-1)
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
 # ── Model ────────────────────────────────────────────────────────────────────
 
 ATTN_CLASSES = {
@@ -377,6 +548,8 @@ ATTN_CLASSES = {
     "online_mem": OnlineMemoryAttention,
     "multi_scale": MultiScaleMemoryAttention,
     "dual_path": DualPathAttention,
+    "dual_decay": DualDecayMemoryAttention,
+    "learned_decay": LearnedDecayMemoryAttention,
 }
 
 class Block(nn.Module):

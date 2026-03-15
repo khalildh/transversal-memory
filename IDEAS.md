@@ -221,12 +221,34 @@ Per-sequence storage test (2-layer, 7 epochs, from scratch):
    layers). The SDR encode/decode pipeline is too lossy and the model's
    learned projections already handle cold-start efficiently.
 
-#### 3f. Multi-scale memory
+#### 3f. Multi-scale memory ← TESTED, promising at seq=256
 
-Run two parallel Gram memories with different decay rates: fast (λ=0.95,
-sentence-level) and slow (λ=0.999, document-level). Different heads could
-read from different timescales. This lets the model capture both local
-syntactic patterns and global topic structure.
+**Dual decay**: Half heads at λ=0.95 (sentence), half at λ=0.999 (document).
+**Learned decay**: Each head learns its own λ via sigmoid(param).
+
+Rapid screening (2-layer, 10% data, ROCm):
+
+**seq=128:**
+| Model | vs Standard |
+|-------|-------------|
+| Online mem (λ=0.99) | -0.6% |
+| Dual decay (0.95/0.999) | -0.6% |
+| Learned decay | +1.0% (no benefit) |
+
+**seq=256:**
+| Model | vs Standard |
+|-------|-------------|
+| Online mem (λ=0.99) | -1.7% |
+| Dual decay (0.95/0.999) | -3.2% |
+| **Learned decay** | **-3.5%** |
+
+**seq=512:** Too underfit with 10% data to draw conclusions.
+
+**Finding**: Per-head decay rates matter most at longer sequences where
+the Gram needs to balance local syntax and global topic structure.
+Learned decay is best at seq=256 — the model discovers optimal timescales.
+At seq=128, all decay approaches perform similarly (consistent with 3c).
+**Needs full-data verification at seq=256.**
 
 #### 3g. Gram eigenstructure as features
 
