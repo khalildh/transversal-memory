@@ -490,9 +490,13 @@ def get_lr(step, cfg, total_steps):
     progress = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
     return cfg.lr * 0.5 * (1 + math.cos(math.pi * progress))
 
-def train(attn_type, cfg, device, from_checkpoint=True, **kw):
+def train(attn_type, cfg, device, from_checkpoint=True, data_frac=1.0, **kw):
     enc = tiktoken.get_encoding("gpt2")
     train_data = load_tokens_cached("train", cfg)
+    if data_frac < 1.0:
+        n = int(len(train_data) * data_frac)
+        train_data = train_data[:n]
+        print(f"  Using {data_frac*100:.0f}% of training data ({n:,} tokens)")
     val_data = load_tokens_cached("val", cfg)
 
     model = LM(enc.n_vocab, cfg, attn_type, **kw).to(device)
@@ -594,6 +598,9 @@ def main():
     parser.add_argument("--decay", type=float, default=0.99, help="Memory decay rate")
     parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length")
     parser.add_argument("--point-dim", type=int, default=4, help="Point dimension (4=6D Plücker, 5=10D, 6=15D)")
+    parser.add_argument("--data-frac", type=float, default=1.0, help="Fraction of training data to use")
+    parser.add_argument("--layers", type=int, default=None, help="Override number of layers")
+    parser.add_argument("--d-model", type=int, default=None, help="Override model dimension")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -604,6 +611,12 @@ def main():
         cfg.d_model = 128
         cfg.n_heads = 4
         print("  FAST MODE: 2 layers, d=128, 4 heads")
+
+    if args.layers:
+        cfg.n_layers = args.layers
+    if args.d_model:
+        cfg.d_model = args.d_model
+        cfg.n_heads = max(1, args.d_model // 32)  # ~32 per head
 
     if args.seq_len:
         cfg.seq_len = args.seq_len
@@ -625,12 +638,14 @@ def main():
     # Train baseline if requested
     if args.baseline:
         print("\n  Training standard baseline...")
-        std, _, std_p = train("standard", cfg, device, from_checkpoint=False)
+        std, _, std_p = train("standard", cfg, device, from_checkpoint=False,
+                              data_frac=args.data_frac)
         print(f"  Standard baseline: PPL {min(std_p):.1f}")
 
     # Train variant
     var, _, var_p = train(args.variant, cfg, device,
-                          from_checkpoint=not args.from_scratch, **kw)
+                          from_checkpoint=not args.from_scratch,
+                          data_frac=args.data_frac, **kw)
 
     # Results
     print(f"\n{'='*60}")
