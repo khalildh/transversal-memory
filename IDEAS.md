@@ -209,14 +209,28 @@ axes directly to the attention mechanism.
 
 More complex to implement (differentiable eigendecomposition needed).
 
-#### 3h. Multi-scale write lines (from Grassmann Flows)
+#### 3h. Multi-scale write lines (from Grassmann Flows) ← TESTED, marginal
 
 Instead of only pairing consecutive tokens (offset=1), pair at offsets
 {1, 2, 4, 8}. Each offset produces write lines that capture structure
 at different timescales. All offsets accumulate into the same Gram.
 This is the one useful idea from the Grassmann Flows paper (Dec 2025).
 
-Easy to implement: loop over offsets in the write line computation.
+Implementation: `exp_fast.py`, MultiScaleMemoryAttention class.
+
+Results (from scratch):
+| Model | 2-layer PPL | 4-layer PPL |
+|-------|-------------|-------------|
+| Standard | 504.2 | ~244 |
+| Online mem (offset=1) | 492.7 | 243.7 |
+| Multi-scale ({1,2,4,8}) | 489.1 | 243.4 |
+
+**Finding**: Multi-scale helps at 2 layers (-3.6 PPL) but is negligible at
+4 layers (-0.3 PPL). The deeper model already captures multi-scale
+structure through its multiple attention layers. Not worth the ~18%
+computational overhead for the full model.
+
+Overhead: ~8s/epoch (2-layer), ~16s/epoch (4-layer) — modest.
 
 #### 3i. Dual-pathway incidence attention ← TESTED, negative
 
