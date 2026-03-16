@@ -282,6 +282,97 @@ class MultiScaleMemoryAttention(nn.Module):
         return self.out(seq_out + gated * mem_val)
 
 
+class GramMLPAttention(nn.Module):
+    """Gram matrix with MLP readout — vector-valued memory instead of scalar gate.
+
+    Instead of collapsing the Gram to a scalar score, extracts the upper triangle
+    (21 features for 6×6) and projects through a small MLP to produce a d_head
+    vector per head. This lets the model read rich structure from the Gram rather
+    than getting a single yes/no gate.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        n_gram = self.plucker_dim * (self.plucker_dim + 1) // 2  # 21 for 6×6
+        self.n_gram_features = n_gram
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+
+        # MLP: upper triangle of Gram → d_head vector per head
+        self.gram_mlp = nn.Sequential(
+            nn.Linear(n_gram, self.d_head),
+            nn.GELU(),
+            nn.Linear(self.d_head, self.d_head),
+        )
+        self.mem_gate = nn.Linear(d_model, n_heads)
+
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+        triu_i, triu_j = torch.triu_indices(self.plucker_dim, self.plucker_dim)
+        self.register_buffer('triu_i', triu_i)
+        self.register_buffer('triu_j', triu_j)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        pd = self.plucker_dim
+
+        # Standard attention
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = std_attn @ v  # (B, H, T, dh)
+
+        # Write lines from bigrams
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        w1 = self.W1_write(x_prev).reshape(B, T, H, self.point_dim)
+        w2 = self.W2_write(x).reshape(B, T, H, self.point_dim)
+        write_lines = exterior(w1, w2, self.pairs)  # (B, T, H, pd)
+        wl = write_lines.permute(0, 2, 1, 3)  # (B, H, T, pd)
+
+        # Outer products for all positions
+        outer = wl.unsqueeze(-1) * wl.unsqueeze(-2)  # (B, H, T, pd, pd)
+
+        # Sequential scan: M_t = decay * M_{t-1} + outer_{t-1}
+        grams = torch.zeros(B, H, T, pd, pd, device=x.device)
+        M = torch.zeros(B, H, pd, pd, device=x.device)
+        for t in range(T):
+            grams[:, :, t] = M
+            M = self.decay * M + outer[:, :, t]
+
+        # Extract upper triangle → (B, H, T, n_gram_features)
+        gram_features = grams[:, :, :, self.triu_i, self.triu_j]
+
+        # MLP readout → (B, H, T, dh)
+        mem_out = self.gram_mlp(gram_features)
+
+        # Input-dependent gate per head
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        gate = gate.permute(0, 2, 1).unsqueeze(-1)  # (B, H, T, 1)
+
+        # Standard attention output + gated memory vector per head
+        combined = seq_out + gate * mem_out
+        combined = combined.transpose(1, 2).reshape(B, T, D)
+        return self.out(combined)
+
+
 class DualPathAttention(nn.Module):
     """
     Dual-pathway: standard Q·K attention + Plücker incidence attention.
@@ -372,6 +463,7 @@ ATTN_CLASSES = {
     "standard": StandardAttention,
     "online_mem": OnlineMemoryAttention,
     "multi_scale": MultiScaleMemoryAttention,
+    "gram_mlp": GramMLPAttention,
     "dual_path": DualPathAttention,
 }
 

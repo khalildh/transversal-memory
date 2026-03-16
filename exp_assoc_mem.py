@@ -1,27 +1,22 @@
 """
-exp_assoc_mem.py — Online associative memory for language modeling
+exp_assoc_mem.py — Triadic associative memory for inference-time LM boosting
 
-Instead of seeding M₀ at sequence start (which doesn't help), this gives the
-model a persistent associative memory it can read/write at every position.
+Cognition-inspired: encode experiences during training, recall at decision time.
 
 Architecture:
-  - Standard Q·K attention (unchanged)
-  - Online Gram accumulation within sequence (unchanged)
-  - Triadic associative memory: write hidden states during training,
-    query at every position during forward pass → additive memory signal
+  1. Train online_mem model normally (Plücker geometry within-sequence)
+  2. Build memory: scan training data, encode write lines as SDRs,
+     store (context_SDR, layer_SDR, token_SDR) triples in TorchTriadicMemory
+  3. Eval: query triadic memory → recalled token SDR → decode via codebook
+     → interpolate with model logits via λ
 
-The triadic memory stores (key_SDR, layer_SDR, value_SDR) triples.
-Keys are derived from the model's Plücker write lines (geometric fingerprint).
-Values are hidden state representations.
-
-Batched querying: instead of one-at-a-time triadic queries, we batch all
-positions in a sequence into a single matrix multiply against the indicator
-matrices.
+Uses TorchTriadicMemory (sparse COO backend) from TDGA — the real triadic
+memory with N×N×N cube semantics via sparse matrices. Query reinforcement
+comes from P² address pairs all pointing to the same z-bits.
 
 Usage:
-  uv run python exp_assoc_mem.py --fast --baseline --from-scratch
-  uv run python exp_assoc_mem.py --fast --from-scratch    # assoc mem only
-  uv run python exp_assoc_mem.py --baseline --from-scratch
+  uv run python exp_assoc_mem.py --fast --from-scratch          # full pipeline
+  uv run python exp_assoc_mem.py --fast --eval-only             # skip training
 """
 
 import torch
@@ -38,6 +33,7 @@ from pathlib import Path
 from itertools import combinations
 
 sys.path.insert(0, "/Volumes/PRO-G40/Code/TDGA/src")
+from tdga.torch_indicator_memory import TorchIndicatorMemory
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -56,157 +52,15 @@ class Config:
     min_delta = 0.5
     data_dir = Path("data/wikitext")
     cache_dir = Path("data/cache")
-    # Associative memory
-    sdr_n = 5000         # SDR dimensionality
-    sdr_p = 50           # active bits per SDR
+    # Memory
+    sdr_n = 1000         # SDR dimensionality (cube side length)
+    sdr_p = 10           # active bits per SDR
     decay = 0.99         # Gram decay
-    write_interval = 8   # store to assoc memory every N positions
-    mem_start_epoch = 1  # start reading from memory at this epoch
-
-# ── Batched Triadic Memory ────────────────────────────────────────────────────
-
-class BatchedTriadicMemory:
-    """Triadic associative memory with batched GPU queries.
-
-    Stores (key, layer, value) triples as indicator matrices.
-    Supports querying many keys at once via batched matrix multiplies.
-    """
-
-    def __init__(self, N, P, device="cpu"):
-        self.N = N
-        self.P = P
-        self.device = torch.device(device)
-        # Indicator matrices: (num_triples, N)
-        self._key_rows = []
-        self._layer_rows = []
-        self._val_rows = []
-        # Materialized on device
-        self._key_mat = None
-        self._layer_mat = None
-        self._val_mat = None
-        self._dirty = False
-        self.n_stored = 0
-
-    def store_batch(self, key_sdrs, layer_sdr, val_sdrs):
-        """Store a batch of (key, layer, value) triples.
-
-        key_sdrs: list of np.ndarray (sorted indices), one per item
-        layer_sdr: np.ndarray (sorted indices), shared across batch
-        val_sdrs: list of np.ndarray (sorted indices), one per item
-        """
-        N = self.N
-        layer_row = torch.zeros(N, dtype=torch.float32)
-        layer_row[torch.from_numpy(layer_sdr.astype(np.int64))] = 1.0
-
-        for key_sdr, val_sdr in zip(key_sdrs, val_sdrs):
-            key_row = torch.zeros(N, dtype=torch.float32)
-            key_row[torch.from_numpy(key_sdr.astype(np.int64))] = 1.0
-            val_row = torch.zeros(N, dtype=torch.float32)
-            val_row[torch.from_numpy(val_sdr.astype(np.int64))] = 1.0
-            self._key_rows.append(key_row)
-            self._layer_rows.append(layer_row)
-            self._val_rows.append(val_row)
-            self.n_stored += 1
-
-        self._dirty = True
-
-    def _rebuild(self):
-        if not self._dirty or not self._key_rows:
-            return
-
-        for attr, buf in [("_key_mat", self._key_rows),
-                          ("_layer_mat", self._layer_rows),
-                          ("_val_mat", self._val_rows)]:
-            new = torch.stack(buf)
-            existing = getattr(self, attr)
-            if existing is not None:
-                existing_cpu = existing.cpu() if existing.device.type != "cpu" else existing
-                combined = torch.cat([existing_cpu, new], dim=0)
-            else:
-                combined = new
-            setattr(self, attr, combined.to(self.device))
-            buf.clear()
-
-        self._dirty = False
-
-    def query_batch(self, key_dense_batch, layer_sdr):
-        """Query with a batch of dense key vectors + shared layer SDR.
-
-        key_dense_batch: (Q, N) float tensor on device — dense SDR representations
-        layer_sdr: np.ndarray of sorted indices
-
-        Returns: (Q, N) float tensor — summed votes for each query
-        """
-        self._rebuild()
-        if self._key_mat is None or self._key_mat.shape[0] == 0:
-            return None
-
-        # Layer overlap: (T_stored,) — same for all queries
-        layer_oh = torch.zeros(self.N, dtype=torch.float32, device=self.device)
-        layer_oh[torch.from_numpy(layer_sdr.astype(np.int64)).to(self.device)] = 1.0
-        layer_overlap = self._layer_mat @ layer_oh  # (T_stored,)
-
-        # Key overlap: (Q, T_stored) — batched
-        key_overlap = key_dense_batch @ self._key_mat.T  # (Q, T_stored)
-
-        # Combined weights: (Q, T_stored)
-        weights = key_overlap * layer_overlap.unsqueeze(0)
-
-        # Vote into value space: (Q, N)
-        sums = weights @ self._val_mat  # (Q, N)
-
-        return sums
-
-    def sums_to_sdrs(self, sums):
-        """Convert vote sums to SDR indices (top-P per query)."""
-        _, topk = torch.topk(sums, self.P, dim=-1)
-        return topk  # (Q, P) — indices on device
-
-
-# ── SDR encoding via random projection ────────────────────────────────────────
-
-class RandomProjectionEncoder:
-    """Encode continuous vectors as dense binary SDR vectors for batched queries."""
-
-    def __init__(self, input_dim, n=5000, p=50, seed=42):
-        self.n = n
-        self.p = p
-        rng = np.random.default_rng(seed)
-        self.R = rng.standard_normal((input_dim, n)).astype(np.float32)
-        norms = np.linalg.norm(self.R, axis=0, keepdims=True) + 1e-12
-        self.R = self.R / norms
-        self.R_torch = None  # lazy init on device
-        self.R_pinv = np.linalg.pinv(self.R)
-        self.R_pinv_torch = None
-
-    def to_device(self, device):
-        self.R_torch = torch.from_numpy(self.R).to(device)
-        self.R_pinv_torch = torch.from_numpy(self.R_pinv).to(device)
-        return self
-
-    def encode_batch_dense(self, vecs_torch):
-        """(B, input_dim) tensor → (B, N) dense binary SDR vectors on device."""
-        projected = vecs_torch @ self.R_torch  # (B, N)
-        # Top-P per row → binary
-        _, topk = torch.topk(projected, self.p, dim=-1)  # (B, P)
-        dense = torch.zeros_like(projected)
-        dense.scatter_(1, topk, 1.0)
-        return dense
-
-    def encode_single(self, vec_np):
-        """Single numpy vector → sorted SDR indices."""
-        projected = vec_np.astype(np.float32) @ self.R
-        indices = np.argsort(-projected)[:self.p]
-        return np.sort(indices).astype(np.uint32)
-
-    def decode_batch(self, dense_sdrs):
-        """(B, N) dense binary → (B, input_dim) approximate reconstruction."""
-        return dense_sdrs @ self.R_pinv_torch
-
+    store_interval = 8   # store every N positions
 
 # ── Plücker primitives ──────────────────────────────────────────────────────
 
-_PAIRS4 = list(combinations(range(4), 2))  # 6 pairs for P³
+_PAIRS4 = list(combinations(range(4), 2))
 
 _J6 = torch.tensor([
     [0,0,0,0,0,1],[0,0,0,0,-1,0],[0,0,0,1,0,0],
@@ -219,17 +73,78 @@ def exterior(p1, p2):
     return L / L.norm(dim=-1, keepdim=True).clamp(min=1e-12)
 
 
-# ── Attention with Online Associative Memory ─────────────────────────────────
+# ── SDR encoding via random projection ────────────────────────────────────────
 
-class AssocMemoryAttention(nn.Module):
-    """Online Gram memory + persistent associative memory.
+class RandomProjectionEncoder:
+    """Encode continuous vectors as sparse SDR index arrays via random projection + top-k."""
 
-    The online Gram accumulates within-sequence relational structure (as before).
-    The associative memory provides cross-sequence retrieval: at each position,
-    query with current hidden state → get back a value vector from any past
-    sequence that had similar geometric structure.
+    def __init__(self, input_dim, n=1000, p=10, seed=42):
+        self.n = n
+        self.p = p
+        rng = np.random.default_rng(seed)
+        R = rng.standard_normal((input_dim, n)).astype(np.float32)
+        norms = np.linalg.norm(R, axis=0, keepdims=True) + 1e-12
+        self._R = R / norms
+
+    def encode(self, vec):
+        """Single numpy vector → sorted uint32 SDR indices."""
+        projected = vec.astype(np.float32) @ self._R
+        indices = np.argsort(-projected)[:self.p]
+        return np.sort(indices).astype(np.uint32)
+
+    def encode_batch(self, vecs):
+        """(B, dim) numpy array → list of sorted uint32 SDR index arrays."""
+        projected = vecs.astype(np.float32) @ self._R  # (B, N)
+        indices = np.argsort(-projected, axis=-1)[:, :self.p]  # (B, P)
+        return [np.sort(row).astype(np.uint32) for row in indices]
+
+
+# ── Token SDR codebook ───────────────────────────────────────────────────────
+
+class TokenCodebook:
+    """Deterministic random SDR for each token in vocab.
+
+    Each token gets a fixed random SDR. At decode time, query the triadic
+    memory → get recalled SDR sums → compare with all token SDRs → distribution.
     """
 
+    def __init__(self, vocab_size, sdr_n, sdr_p, seed=12345):
+        self.vocab_size = vocab_size
+        self.sdr_n = sdr_n
+        self.sdr_p = sdr_p
+        rng = np.random.default_rng(seed)
+        # Pre-generate all token SDRs as sparse index arrays
+        self.token_sdrs = []
+        for _ in range(vocab_size):
+            idx = np.sort(rng.choice(sdr_n, size=sdr_p, replace=False)).astype(np.uint32)
+            self.token_sdrs.append(idx)
+        # Dense codebook for batch decoding: (V, N) float32
+        self._dense = np.zeros((vocab_size, sdr_n), dtype=np.float32)
+        for i, sdr in enumerate(self.token_sdrs):
+            self._dense[i, sdr] = 1.0
+        self._dense_torch = None  # lazy device init
+
+    def to_device(self, device):
+        self._dense_torch = torch.from_numpy(self._dense).to(device)
+        return self
+
+    def get_sdr(self, token_id):
+        """Get SDR for a single token."""
+        return self.token_sdrs[token_id]
+
+    def decode_sums(self, sums_np):
+        """(N,) numpy sums → (V,) overlap scores."""
+        return self._dense @ sums_np  # (V, N) @ (N,) → (V,)
+
+    def decode_sums_batch_torch(self, sums_torch):
+        """(B, N) tensor → (B, V) overlap scores on device."""
+        return sums_torch @ self._dense_torch.T
+
+
+# ── Online Memory Attention (from exp_fast.py) ──────────────────────────────
+
+class OnlineMemoryAttention(nn.Module):
+    """Standard Q·K attention + causal Gram accumulation as scalar gate."""
     def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, **kw):
         super().__init__()
         self.n_heads = n_heads
@@ -237,40 +152,24 @@ class AssocMemoryAttention(nn.Module):
         self.scale = self.d_head ** -0.5
         self.decay = decay
 
-        # Standard attention
         self.qkv = nn.Linear(d_model, 3 * d_model)
-
-        # Plücker lines for online Gram
         self.W1_write = nn.Linear(d_model, 4 * n_heads, bias=False)
         self.W2_write = nn.Linear(d_model, 4 * n_heads, bias=False)
         self.W1_read = nn.Linear(d_model, 4 * n_heads, bias=False)
         self.W2_read = nn.Linear(d_model, 4 * n_heads, bias=False)
-
-        # Online Gram gating
         self.mem_value = nn.Linear(d_model, d_model)
         self.mem_gate = nn.Linear(d_model, n_heads)
         self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
-
-        # Associative memory signal (from triadic recall)
-        self.assoc_proj = nn.Linear(d_model, d_model)
-        self.assoc_gate = nn.Parameter(torch.tensor(0.01))  # start small
-
         self.out = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
         self.register_buffer('J', _J6)
 
-        # Cache write lines for storage
         self._cached_write_lines = None
 
-    def forward(self, x, assoc_values=None):
-        """
-        x: (B, T, D)
-        assoc_values: optional (B, T, D) — recalled values from associative memory
-        """
+    def forward(self, x):
         B, T, D = x.shape
         H, dh = self.n_heads, self.d_head
 
-        # Standard Q·K attention
         qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         std_attn = (q @ k.transpose(-1, -2)) * self.scale
@@ -279,19 +178,16 @@ class AssocMemoryAttention(nn.Module):
         std_attn = self.drop(F.softmax(std_attn, dim=-1))
         seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
 
-        # Write lines from bigrams
         x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
         w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
         w2 = self.W2_write(x).reshape(B, T, H, 4)
-        write_lines = exterior(w1, w2)  # (B, T, H, 6)
+        write_lines = exterior(w1, w2)
         self._cached_write_lines = write_lines.detach()
 
-        # Read lines
         r1 = self.W1_read(x).reshape(B, T, H, 4)
         r2 = self.W2_read(x).reshape(B, T, H, 4)
-        read_lines = exterior(r1, r2)  # (B, T, H, 6)
+        read_lines = exterior(r1, r2)
 
-        # Online Gram incidence (within-sequence)
         J = self.J
         J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
         read_h = read_lines.permute(0, 2, 1, 3)
@@ -307,31 +203,23 @@ class AssocMemoryAttention(nn.Module):
             weights = weights.tril(diagonal=-1)
             incidence_sq = incidence_sq * weights.unsqueeze(0).unsqueeze(0)
 
-        mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
-
-        # Gate and combine online Gram
+        mem_score = incidence_sq.sum(dim=-1)
         mem_val = self.mem_value(x)
-        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        gate = torch.sigmoid(self.mem_gate(x))
         scale = self.mem_scale.reshape(1, H, 1)
-        mem_score_t = mem_score.permute(0, 2, 1)  # (B, T, H)
+        mem_score_t = mem_score.permute(0, 2, 1)
         gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
         gated = gated.mean(dim=-1, keepdim=True)
 
-        combined = seq_out + gated * mem_val
-
-        # Add associative memory signal
-        if assoc_values is not None:
-            combined = combined + self.assoc_gate * self.assoc_proj(assoc_values)
-
-        return self.out(combined)
+        return self.out(seq_out + gated * mem_val)
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
 
 class Block(nn.Module):
-    def __init__(self, d_model, n_heads, attn_cls, dropout=0.1, **kw):
+    def __init__(self, d_model, n_heads, dropout=0.1, **kw):
         super().__init__()
-        self.attn = attn_cls(d_model, n_heads, dropout=dropout, **kw)
+        self.attn = OnlineMemoryAttention(d_model, n_heads, dropout=dropout, **kw)
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
@@ -339,43 +227,20 @@ class Block(nn.Module):
             nn.Linear(4 * d_model, d_model), nn.Dropout(dropout),
         )
 
-    def forward(self, x, assoc_values=None):
-        x = x + self.attn(self.ln1(x), assoc_values=assoc_values)
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
         x = x + self.ffn(self.ln2(x))
         return x
 
 
-class StandardAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, **kw):
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        self.scale = self.d_head ** -0.5
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.out = nn.Linear(d_model, d_model)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x, assoc_values=None):
-        B, T, D = x.shape
-        H, dh = self.n_heads, self.d_head
-        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-1, -2)) * self.scale
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        attn = attn.masked_fill(mask, float('-inf'))
-        attn = self.drop(F.softmax(attn, dim=-1))
-        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
-        return self.out(out)
-
-
 class LM(nn.Module):
-    def __init__(self, vocab_size, cfg, attn_cls, **kw):
+    def __init__(self, vocab_size, cfg, **kw):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
         self.pos_emb = nn.Embedding(cfg.seq_len, cfg.d_model)
         self.blocks = nn.ModuleList([
-            Block(cfg.d_model, cfg.n_heads, attn_cls, cfg.dropout, **kw)
+            Block(cfg.d_model, cfg.n_heads, cfg.dropout, **kw)
             for _ in range(cfg.n_layers)
         ])
         self.ln_f = nn.LayerNorm(cfg.d_model)
@@ -390,158 +255,186 @@ class LM(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, idx, assoc_values_per_layer=None):
+    def forward(self, idx):
         B, T = idx.shape
         x = self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device))
-        for i, block in enumerate(self.blocks):
-            av = assoc_values_per_layer[i] if assoc_values_per_layer is not None else None
-            x = block(x, assoc_values=av)
-        return self.head(self.ln_f(x))
-
-    def get_hidden_states(self, idx):
-        """Get hidden states after each block (for writing to memory)."""
-        B, T = idx.shape
-        x = self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device))
-        states = []
         for block in self.blocks:
             x = block(x)
-            states.append(x.detach())
-        return states
+        return self.head(self.ln_f(x))
 
-    def get_cached_write_lines(self):
-        lines = []
-        for block in self.blocks:
-            if hasattr(block.attn, '_cached_write_lines') and block.attn._cached_write_lines is not None:
-                lines.append(block.attn._cached_write_lines)
-            else:
-                lines.append(None)
-        return lines
+    def get_all_write_lines(self):
+        """Get cached write lines from all layers. List of (B, T, H, 6)."""
+        return [block.attn._cached_write_lines for block in self.blocks]
 
     def count_params(self):
         return sum(p.numel() for p in self.parameters())
 
 
-# ── Associative Memory Manager ───────────────────────────────────────────────
+# ── Triadic SDR Memory ──────────────────────────────────────────────────────
 
-class AssocMemoryManager:
-    """Manages the triadic associative memory for all layers.
+class TriadicSDRMemory:
+    """Inference-time associative memory using TorchIndicatorMemory.
 
-    Keys: Plücker write lines (6D per head, flattened per position)
-    Values: Hidden states (d_model per position)
+    Stores (context_SDR, layer_SDR, token_SDR) triples.
+    TorchIndicatorMemory keeps triples separate as indicator rows —
+    no interference ceiling, better recall at scale, GPU-friendly matmul queries.
+
+    Build: scan training data → encode write lines as context SDRs →
+           store (context, layer, token) triples
+    Query: encode current write lines → indicator query → token SDR sums →
+           decode via codebook overlap → token distribution
     """
 
-    def __init__(self, cfg, device):
+    def __init__(self, key_dim, cfg, vocab_size):
         self.cfg = cfg
-        self.device = device
-        self.n_layers = cfg.n_layers
+        self.key_dim = key_dim
+        self.vocab_size = vocab_size
+        self.encoder = RandomProjectionEncoder(
+            key_dim, n=cfg.sdr_n, p=cfg.sdr_p
+        )
+        self.codebook = TokenCodebook(vocab_size, cfg.sdr_n, cfg.sdr_p)
 
-        # Key encoder: uses flattened write lines (n_heads * 6 = 36 for 6 heads)
-        key_dim = cfg.n_heads * 6
-        self.key_encoder = RandomProjectionEncoder(
-            key_dim, n=cfg.sdr_n, p=cfg.sdr_p, seed=100
-        ).to_device(device)
+        # Layer SDRs: fixed random SDR per layer
+        rng = np.random.default_rng(99999)
+        self.layer_sdrs = []
+        for _ in range(cfg.n_layers):
+            idx = np.sort(rng.choice(cfg.sdr_n, size=cfg.sdr_p, replace=False)).astype(np.uint32)
+            self.layer_sdrs.append(idx)
 
-        # Value encoder: uses hidden states (d_model)
-        self.val_encoder = RandomProjectionEncoder(
-            cfg.d_model, n=cfg.sdr_n, p=cfg.sdr_p, seed=200
-        ).to_device(device)
-
-        # Fixed layer SDRs
-        rng = np.random.default_rng(300)
-        self.layer_sdrs = [
-            np.sort(rng.permutation(cfg.sdr_n)[:cfg.sdr_p]).astype(np.uint32)
-            for _ in range(cfg.n_layers)
-        ]
-
-        # One triadic memory per layer (keeps them separate, faster queries)
+        # One TorchIndicatorMemory per layer (CPU for build, can move to device)
         self.memories = [
-            BatchedTriadicMemory(N=cfg.sdr_n, P=cfg.sdr_p, device=str(device))
+            TorchIndicatorMemory(cfg.sdr_n, cfg.sdr_p, device="cpu")
             for _ in range(cfg.n_layers)
         ]
+        self.n_stored = 0
 
-    def write(self, write_lines_per_layer, hidden_states_per_layer, interval=8):
-        """Write to associative memory from cached write lines + hidden states.
+    def build(self, model, data, cfg, device):
+        """Scan training data, store (context_SDR, layer_SDR, token_SDR) triples."""
+        model.eval()
+        batches = make_batches(data, cfg.seq_len, cfg.batch_size)
+        interval = cfg.store_interval
+        n_total = 0
 
-        Subsamples positions by interval to control memory growth.
-        write_lines_per_layer: list of (B, T, H, 6) tensors
-        hidden_states_per_layer: list of (B, T, D) tensors
+        print(f"    Building triadic memory (N={cfg.sdr_n}, P={cfg.sdr_p}, interval={interval})...")
+        t0 = time.time()
+
+        with torch.no_grad():
+            for bi, (xb, yb) in enumerate(batches):
+                xb_dev = xb.to(device)
+                _ = model(xb_dev)
+
+                B, T = xb.shape
+                all_wl = model.get_all_write_lines()
+
+                # Subsample positions
+                positions = list(range(0, T, interval))
+
+                for layer_idx, wl in enumerate(all_wl):
+                    # wl: (B, T, H, 6) — get subsampled, flatten heads
+                    wl_sub = wl[:, positions, :, :].cpu().numpy()  # (B, n_pos, H, 6)
+                    B_actual, n_pos = wl_sub.shape[0], wl_sub.shape[1]
+                    wl_flat = wl_sub.reshape(B_actual * n_pos, -1)  # (B*n_pos, H*6)
+
+                    # Encode context as SDRs
+                    context_sdrs = self.encoder.encode_batch(wl_flat)
+
+                    # Get target tokens at these positions
+                    tok_sub = yb[:, positions].reshape(-1)  # (B*n_pos,)
+
+                    layer_sdr = self.layer_sdrs[layer_idx]
+
+                    for i in range(len(context_sdrs)):
+                        token_sdr = self.codebook.get_sdr(tok_sub[i].item())
+                        self.memories[layer_idx].store(
+                            context_sdrs[i], layer_sdr, token_sdr
+                        )
+
+                n_total += B * len(positions)
+
+                if (bi + 1) % 10 == 0:
+                    print(f"      batch {bi+1}/{len(batches)}, triples={n_total * cfg.n_layers}")
+
+        # Flush pending stores
+        for mem in self.memories:
+            mem._rebuild()
+
+        self.n_stored = n_total
+        elapsed = time.time() - t0
+        print(f"    Memory built: {n_total:,} entries × {cfg.n_layers} layers in {elapsed:.1f}s")
+
+        # Report memory usage (indicator matrices: 3 × (T, N) per layer)
+        total_bytes = 0
+        for mem in self.memories:
+            for attr in ['_x_mat', '_y_mat', '_z_mat']:
+                mat = getattr(mem, attr, None)
+                if mat is not None:
+                    total_bytes += mat.nelement() * mat.element_size()
+        print(f"    Indicator storage: {total_bytes / 1e6:.1f} MB")
+
+    def query_token_distribution(self, model, xb_dev, verbose=False):
+        """Query indicator memory for token predictions — batched via matmul.
+
+        Per-sequence: mean-pool write lines → encode SDR → batch indicator query →
+        recalled token SDR sums → decode via codebook overlap → distribution.
+
+        Uses direct matmul against indicator matrices instead of per-sequence
+        .query() calls. Same math, ~100x faster.
+
+        Returns: (B, V) numpy array of overlap scores.
         """
-        for layer_idx in range(self.n_layers):
-            wl = write_lines_per_layer[layer_idx]
-            hs = hidden_states_per_layer[layer_idx]
-            if wl is None or hs is None:
-                continue
+        B = xb_dev.shape[0]
+        all_wl = model.get_all_write_lines()
+        N = self.cfg.sdr_n
+        P = self.cfg.sdr_p
 
-            B, T, H, _ = wl.shape
+        # Accumulate token SDR sums across layers
+        token_sums = np.zeros((B, N), dtype=np.float32)
 
-            # Flatten write lines per position: (B, T, H*6)
-            wl_flat = wl.reshape(B, T, H * 6)
-
-            # Subsample positions
-            positions = list(range(0, T, interval))
-            if not positions:
-                continue
-
-            for pos in positions:
-                # Encode keys for all batch items at this position
-                keys_at_pos = wl_flat[:, pos, :]  # (B, H*6)
-                vals_at_pos = hs[:, pos, :]  # (B, D)
-
-                # Encode as SDRs (numpy, one at a time for now)
-                key_sdrs = []
-                val_sdrs = []
-                for b in range(B):
-                    key_sdrs.append(self.key_encoder.encode_single(
-                        keys_at_pos[b].cpu().numpy()))
-                    val_sdrs.append(self.val_encoder.encode_single(
-                        vals_at_pos[b].cpu().numpy()))
-
-                self.memories[layer_idx].store_batch(
-                    key_sdrs, self.layer_sdrs[layer_idx], val_sdrs)
-
-    def read(self, write_lines_per_layer):
-        """Read from associative memory for all positions.
-
-        Returns list of (B, T, D) tensors per layer — recalled values.
-        """
-        results = []
-        for layer_idx in range(self.n_layers):
-            wl = write_lines_per_layer[layer_idx]
+        for layer_idx, wl in enumerate(all_wl):
             mem = self.memories[layer_idx]
+            mem._rebuild()  # ensure matrices are materialized
 
-            if wl is None or mem.n_stored == 0:
-                results.append(None)
+            if mem._x_mat is None or mem._x_mat.shape[0] == 0:
                 continue
 
-            B, T, H, _ = wl.shape
-            wl_flat = wl.reshape(B, T, H * 6)
+            # Mean-pool write lines per sequence: (B, T, H, 6) → (B, H*6)
+            wl_pooled = wl.mean(dim=1).reshape(B, -1).cpu().numpy()
 
-            # Encode all positions as dense SDR keys: (B*T, N)
-            wl_2d = wl_flat.reshape(B * T, H * 6)
-            key_dense = self.key_encoder.encode_batch_dense(wl_2d)  # (B*T, N)
+            # Encode all B sequences as SDRs → build dense query matrix
+            context_sdrs = self.encoder.encode_batch(wl_pooled)  # list of (P,) arrays
+            # Build (B, N) dense binary query vectors
+            x_query = np.zeros((B, N), dtype=np.float32)
+            for i, sdr in enumerate(context_sdrs):
+                x_query[i, sdr] = 1.0
 
-            # Batched query: (B*T, N) → (B*T, N) vote sums
-            vote_sums = mem.query_batch(key_dense, self.layer_sdrs[layer_idx])
+            # Build (N,) one-hot for layer SDR
+            y_onehot = np.zeros(N, dtype=np.float32)
+            y_onehot[self.layer_sdrs[layer_idx]] = 1.0
 
-            if vote_sums is None:
-                results.append(None)
-                continue
+            # Batched indicator query:
+            #   overlap_x[b, t] = x_query[b] · x_ind[t]  → (B, T_stored)
+            #   overlap_y[t]    = y_ind[t] · y_onehot     → (T_stored,)
+            #   weights[b, t]   = overlap_x[b,t] * overlap_y[t]  → (B, T_stored)
+            #   sums[b]         = weights[b] @ z_ind       → (B, N)
+            x_ind = mem._x_mat.cpu().numpy()  # (T_stored, N)
+            y_ind = mem._y_mat.cpu().numpy()
+            z_ind = mem._z_mat.cpu().numpy()
 
-            # Decode votes back to value space: (B*T, N) → (B*T, D)
-            # Use top-P to get SDR, then decode
-            # But we can also decode directly from the soft votes (smoother)
-            recalled_vals = self.val_encoder.decode_batch(vote_sums)  # (B*T, D)
+            overlap_x = x_query @ x_ind.T       # (B, T_stored)
+            overlap_y = y_ind @ y_onehot         # (T_stored,)
+            weights = overlap_x * overlap_y      # (B, T_stored) — conjunction
+            sums = weights @ z_ind               # (B, N)
 
-            # Normalize to prevent scale explosion
-            recalled_vals = recalled_vals / (recalled_vals.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+            token_sums += sums
 
-            results.append(recalled_vals.reshape(B, T, -1))
+        if verbose:
+            active = (token_sums > 0).sum(axis=1)
+            print(f"      Token sums: mean active bits={active.mean():.1f} "
+                  f"max_sum={token_sums.max():.1f}")
 
-        return results
-
-    @property
-    def total_stored(self):
-        return sum(m.n_stored for m in self.memories)
+        # Decode: sums @ codebook → (B, V) overlap scores
+        scores = token_sums @ self.codebook._dense.T
+        return scores
 
 
 # ── Data (cached) ────────────────────────────────────────────────────────────
@@ -587,25 +480,26 @@ def get_lr(step, cfg, total_steps):
     return cfg.lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-# ── Training ──────────────────────────────────────────────────────────────────
+# ── Training (standard — no memory involvement) ─────────────────────────────
 
-def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
-          label="assoc_mem", **kw):
+def train_model(cfg, device, label="online_mem"):
     enc = tiktoken.get_encoding("gpt2")
     train_data = load_tokens_cached("train", cfg)
+    if hasattr(cfg, 'data_frac') and cfg.data_frac < 1.0:
+        n = int(len(train_data) * cfg.data_frac)
+        train_data = train_data[:n]
+        print(f"    Using {cfg.data_frac*100:.0f}% of training data ({n:,} tokens)")
     val_data = load_tokens_cached("val", cfg)
 
-    model = LM(enc.n_vocab, cfg, attn_cls, **kw).to(device)
+    model = LM(enc.n_vocab, cfg, decay=cfg.decay).to(device)
     print(f"\n  {label}: {model.count_params():,} params")
-
-    assoc = AssocMemoryManager(cfg, device) if use_assoc else None
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.01)
     n_batches = len(make_batches(train_data, cfg.seq_len, cfg.batch_size))
     total_steps = n_batches * cfg.n_epochs
 
-    losses, ppls = [], []
     best_ppl = float('inf')
+    best_state = None
     patience_counter = 0
     global_step = 0
 
@@ -614,7 +508,6 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
         model.train()
         batches = make_batches(train_data, cfg.seq_len, cfg.batch_size)
         ep_loss = 0.0
-        read_batches = 0
 
         for xb, yb in batches:
             lr = get_lr(global_step, cfg, total_steps)
@@ -622,23 +515,7 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
                 pg['lr'] = lr
 
             xb, yb = xb.to(device), yb.to(device)
-
-            # Read from associative memory (if enabled and past warmup)
-            assoc_values = None
-            if use_assoc and assoc is not None and ep >= cfg.mem_start_epoch:
-                with torch.no_grad():
-                    # Need write lines from current input to form queries
-                    # Do a no-grad forward to get write lines
-                    _ = model(xb)
-                    wl_per_layer = model.get_cached_write_lines()
-                    assoc_values = assoc.read(wl_per_layer)
-                    if any(v is not None for v in assoc_values):
-                        read_batches += 1
-
-            # Forward with optional associative memory values
-            logits = model(xb, assoc_values_per_layer=assoc_values)
-            loss = F.cross_entropy(logits.view(-1, enc.n_vocab), yb.view(-1))
-
+            loss = F.cross_entropy(model(xb).view(-1, enc.n_vocab), yb.view(-1))
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -646,36 +523,22 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
             ep_loss += loss.item()
             global_step += 1
 
-            # Write to associative memory
-            if use_assoc and assoc is not None:
-                with torch.no_grad():
-                    wl_per_layer = model.get_cached_write_lines()
-                    # Get hidden states for values
-                    hs_per_layer = model.get_hidden_states(xb)
-                    assoc.write(wl_per_layer, hs_per_layer,
-                               interval=cfg.write_interval)
-
         avg = ep_loss / len(batches)
-        losses.append(avg)
 
-        # Validation (without assoc memory for fair comparison)
         model.eval()
         with torch.no_grad():
             vb = make_batches(val_data, cfg.seq_len, cfg.batch_size)
             vl = sum(F.cross_entropy(model(x.to(device)).view(-1, enc.n_vocab),
                      y.to(device).view(-1)).item() for x, y in vb) / len(vb)
         ppl = math.exp(min(vl, 20))
-        ppls.append(ppl)
 
         elapsed = time.time() - t0
         improved = "★" if ppl < best_ppl - cfg.min_delta else ""
-        mem_info = ""
-        if assoc:
-            mem_info = f" read={read_batches}/{len(batches)} stored={assoc.total_stored}"
-        print(f"    ep {ep+1:2d}: loss={avg:.3f}  ppl={ppl:.1f}  ({elapsed:.1f}s){mem_info} {improved}")
+        print(f"    ep {ep+1:2d}: loss={avg:.3f}  ppl={ppl:.1f}  ({elapsed:.1f}s) {improved}")
 
         if ppl < best_ppl - cfg.min_delta:
             best_ppl = ppl
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
@@ -683,27 +546,87 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
                 print(f"    Early stopping (no improvement for {cfg.patience} epochs)")
                 break
 
-    # Evaluate WITH assoc memory on val set
-    if use_assoc and assoc is not None and assoc.total_stored > 0:
-        model.eval()
-        with torch.no_grad():
-            vb = make_batches(val_data, cfg.seq_len, cfg.batch_size)
-            assoc_losses = []
-            for x, y in vb:
-                x, y = x.to(device), y.to(device)
-                _ = model(x)
-                wl = model.get_cached_write_lines()
-                av = assoc.read(wl)
-                vl = F.cross_entropy(model(x, assoc_values_per_layer=av).view(-1, enc.n_vocab),
-                                     y.view(-1)).item()
-                assoc_losses.append(vl)
-            assoc_vl = sum(assoc_losses) / len(assoc_losses)
-        assoc_ppl = math.exp(min(assoc_vl, 20))
-        print(f"\n    Val PPL (no assoc):   {best_ppl:.1f}")
-        print(f"    Val PPL (with assoc): {assoc_ppl:.1f}")
-        print(f"    Assoc delta:          {assoc_ppl - best_ppl:+.1f}")
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
-    return model, losses, ppls
+    Path("checkpoints").mkdir(exist_ok=True)
+    ckpt_path = Path("checkpoints/lm_assoc_mem.pt")
+    torch.save({
+        "model": model.state_dict(),
+        "best_ppl": best_ppl,
+        "vocab": enc.n_vocab,
+    }, ckpt_path)
+    print(f"    Saved checkpoint: {ckpt_path} (PPL {best_ppl:.1f})")
+
+    return model, best_ppl
+
+
+# ── Evaluation with triadic memory ──────────────────────────────────────────
+
+def eval_with_memory(model, memory, cfg, device, lam=0.1):
+    """Evaluate model with triadic memory interpolation.
+
+    Per sequence: triadic query → token distribution (B, V)
+    Broadcast to all positions, interpolate with model probs.
+    """
+    enc = tiktoken.get_encoding("gpt2")
+    val_data = load_tokens_cached("val", cfg)
+    batches = make_batches(val_data, cfg.seq_len, cfg.batch_size)
+
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+
+    with torch.no_grad():
+        for xb, yb in batches:
+            xb, yb = xb.to(device), yb.to(device)
+            logits = model(xb)  # (B, T, V)
+            B, T, V = logits.shape
+
+            if lam == 0.0:
+                loss = F.cross_entropy(logits.view(-1, V), yb.view(-1))
+            else:
+                # Triadic memory query → (B, V) overlap scores
+                mem_scores = memory.query_token_distribution(
+                    model, xb, verbose=(n_batches == 0)
+                )  # numpy (B, V)
+                mem_scores_t = torch.from_numpy(mem_scores).float().to(device)
+
+                # Normalize to probabilities
+                mem_probs = F.softmax(mem_scores_t, dim=-1)  # (B, V)
+
+                # Broadcast to all positions: (B, 1, V) → (B, T, V)
+                mem_probs = mem_probs.unsqueeze(1).expand(B, T, V)
+                model_probs = F.softmax(logits, dim=-1)
+
+                combined = (1 - lam) * model_probs + lam * mem_probs
+                combined_log = torch.log(combined + 1e-10)
+
+                loss = F.nll_loss(combined_log.view(-1, V), yb.view(-1))
+
+            total_loss += loss.item()
+            n_batches += 1
+
+    avg_loss = total_loss / n_batches
+    ppl = math.exp(min(avg_loss, 20))
+    return ppl
+
+
+def sweep_lambda(model, memory, cfg, device):
+    lambdas = [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
+    print(f"\n    Sweeping λ ({len(lambdas)} values)...")
+
+    results = []
+    for lam in lambdas:
+        t0 = time.time()
+        ppl = eval_with_memory(model, memory, cfg, device, lam=lam)
+        elapsed = time.time() - t0
+        results.append((lam, ppl))
+        print(f"      λ={lam:.2f}  PPL={ppl:.1f}  ({elapsed:.1f}s)")
+
+    best_lam, best_ppl = min(results, key=lambda x: x[1])
+    print(f"\n    Best: λ={best_lam:.2f}  PPL={best_ppl:.1f}")
+    return best_lam, best_ppl, results
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -711,66 +634,84 @@ def train(attn_cls, cfg, device, from_checkpoint=False, use_assoc=False,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast", action="store_true", help="2-layer screening model")
-    parser.add_argument("--baseline", action="store_true", help="Also train online_mem baseline")
-    parser.add_argument("--from-scratch", action="store_true", help="Train from scratch")
+    parser.add_argument("--from-scratch", action="store_true")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--seq-len", type=int, default=None)
-    parser.add_argument("--bs", type=int, default=None)
-    parser.add_argument("--write-interval", type=int, default=8,
-                        help="Write to memory every N positions (controls memory growth)")
     parser.add_argument("--decay", type=float, default=0.99)
+    parser.add_argument("--sdr-n", type=int, default=1000, help="SDR dimensionality")
+    parser.add_argument("--sdr-p", type=int, default=10, help="SDR active bits")
+    parser.add_argument("--store-interval", type=int, default=8)
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--data-frac", type=float, default=1.0,
+                        help="Fraction of training data to use (0.1 = 10%%)")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     cfg = Config()
     cfg.n_epochs = args.epochs
     cfg.decay = args.decay
-    cfg.write_interval = args.write_interval
+    cfg.sdr_n = args.sdr_n
+    cfg.sdr_p = args.sdr_p
+    cfg.store_interval = args.store_interval
+    cfg.data_frac = args.data_frac
 
     if args.seq_len:
         cfg.seq_len = args.seq_len
-
-    if args.bs:
-        cfg.batch_size = args.bs
 
     if args.fast:
         cfg.n_layers = 2
         cfg.d_model = 128
         cfg.n_heads = 4
         print("  FAST MODE: 2 layers, d=128, 4 heads")
-    else:
-        if cfg.batch_size > 64:
-            cfg.batch_size = 64
+
+    key_dim = cfg.n_heads * 6
 
     print(f"{'='*60}")
-    print(f"  Online Associative Memory LM")
+    print(f"  Triadic Associative Memory LM (inference-time)")
     print(f"  layers={cfg.n_layers} d={cfg.d_model} heads={cfg.n_heads}")
     print(f"  seq={cfg.seq_len} bs={cfg.batch_size} epochs={cfg.n_epochs}")
-    print(f"  decay={cfg.decay} write_interval={cfg.write_interval}")
-    print(f"  SDR: N={cfg.sdr_n} P={cfg.sdr_p}")
+    print(f"  SDR: N={cfg.sdr_n} P={cfg.sdr_p} key_dim={key_dim}")
+    print(f"  Memory: interval={cfg.store_interval} data_frac={cfg.data_frac}")
     print(f"{'='*60}")
 
-    kw = {"decay": cfg.decay}
+    # ── Step 1: Train model (or load checkpoint) ──
+    ckpt_path = Path("checkpoints/lm_assoc_mem.pt")
+    if args.eval_only and ckpt_path.exists():
+        print("\n  Step 1: Loading checkpoint...")
+        enc = tiktoken.get_encoding("gpt2")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model = LM(ckpt["vocab"], cfg, decay=cfg.decay).to(device)
+        model.load_state_dict(ckpt["model"])
+        base_ppl = ckpt["best_ppl"]
+        print(f"    Loaded {ckpt_path} (PPL {base_ppl:.1f})")
+    else:
+        print("\n  Step 1: Train online_mem model...")
+        model, base_ppl = train_model(cfg, device)
+    print(f"\n  Baseline PPL (no memory): {base_ppl:.1f}")
 
-    # Baseline: online_mem without associative memory
-    if args.baseline:
-        print("\n  Training online_mem baseline...")
-        _, _, base_ppls = train(AssocMemoryAttention, cfg, device,
-                                from_checkpoint=not args.from_scratch,
-                                use_assoc=False, label="online_mem", **kw)
-        print(f"  Online mem baseline: PPL {min(base_ppls):.1f}")
+    # ── Step 2: Build triadic memory ──
+    print(f"\n  Step 2: Build triadic memory from training data...")
+    enc = tiktoken.get_encoding("gpt2")
+    train_data = load_tokens_cached("train", cfg)
+    if cfg.data_frac < 1.0:
+        train_data = train_data[:int(len(train_data) * cfg.data_frac)]
+    memory = TriadicSDRMemory(key_dim, cfg, enc.n_vocab)
+    memory.codebook.to_device(device)
+    memory.build(model, train_data, cfg, device)
 
-    # Associative memory version
-    print("\n  Training with online associative memory...")
-    _, _, assoc_ppls = train(AssocMemoryAttention, cfg, device,
-                             from_checkpoint=not args.from_scratch,
-                             use_assoc=True, label="assoc_mem", **kw)
+    # ── Step 3: Evaluate with triadic memory interpolation ──
+    print(f"\n  Step 3: Evaluate with triadic memory interpolation...")
+    best_lam, best_ppl, results = sweep_lambda(model, memory, cfg, device)
 
+    # ── Results ──
     print(f"\n{'='*60}")
     print(f"  RESULTS")
-    print(f"  Assoc mem: best PPL = {min(assoc_ppls):.1f}")
-    if args.baseline:
-        print(f"  Online mem baseline: PPL {min(base_ppls):.1f}")
+    print(f"  Baseline (no memory):  PPL {base_ppl:.1f}")
+    print(f"  With triadic memory:   PPL {best_ppl:.1f} (λ={best_lam:.2f})")
+    delta = best_ppl - base_ppl
+    pct = delta / base_ppl * 100
+    print(f"  Delta:                 {delta:+.1f} ({pct:+.1f}%)")
+    print(f"  Memory entries:        {memory.n_stored:,}")
     print(f"{'='*60}")
 
 
