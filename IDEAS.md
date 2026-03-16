@@ -221,12 +221,102 @@ Per-sequence storage test (2-layer, 7 epochs, from scratch):
    layers). The SDR encode/decode pipeline is too lossy and the model's
    learned projections already handle cold-start efficiently.
 
-#### 3f. Multi-scale memory
+#### 3f. Multi-scale memory ← TESTED, promising at seq=256
 
-Run two parallel Gram memories with different decay rates: fast (λ=0.95,
-sentence-level) and slow (λ=0.999, document-level). Different heads could
-read from different timescales. This lets the model capture both local
-syntactic patterns and global topic structure.
+**Dual decay**: Half heads at λ=0.95 (sentence), half at λ=0.999 (document).
+**Learned decay**: Each head learns its own λ via sigmoid(param).
+
+Rapid screening (2-layer, 10% data, ROCm):
+
+**seq=128:**
+| Model | vs Standard |
+|-------|-------------|
+| Online mem (λ=0.99) | -0.6% |
+| Dual decay (0.95/0.999) | -0.6% |
+| Learned decay | +1.0% (no benefit) |
+
+**seq=256:**
+| Model | vs Standard |
+|-------|-------------|
+| Online mem (λ=0.99) | -1.7% |
+| Dual decay (0.95/0.999) | -3.2% |
+| **Learned decay** | **-3.5%** |
+
+**seq=512:** Too underfit with 10% data to draw conclusions.
+
+**Comprehensive variant sweep at seq=256, rapid (10% data, 2-layer):**
+
+| Rank | Variant | vs Standard | Key idea |
+|------|---------|-------------|----------|
+| 1 | **learned_decay** | **-3.5%** | Learned λ per head + additive gate |
+| 2 | dual_decay | -3.2% | Fixed fast/slow λ |
+| 3 | residual_gram | -2.8% | Multiplicative (1+g)*out |
+| 4 | multi_write | -2.3% | 2 write projection pairs |
+| 5 | trigram | -1.8% | Trigram write context |
+| 6 | online_mem | -1.7% | Single λ=0.99 |
+| 7 | abs_inc | -1.4% | |incidence| instead of ² |
+| 8 | inc_route | -0.5% | Geometry routes values |
+| 9 | learned_power | -0.2% | Learned exponent p |
+| 10 | inc_bias | +0.8% | Geometry biases attention |
+| 11 | resid_learned | +4.2% | Residual + learned (destructive!) |
+
+**Key findings from variant sweep:**
+1. **Additive scalar gate wins**: Geometry as separate gated signal > routing > bias
+2. **incidence² is optimal**: Learned power and |incidence| don't improve
+3. **Learned per-head decay is the strongest single improvement**
+4. **Multiplicative + learned decay is destructive**: Each works alone but
+   their combination creates unstable gradient interactions
+5. **Wider write context marginal**: Trigrams and multi-write help modestly
+6. **J6 matters at seq=256**: Learned decay with identity gets -1.4% vs -3.5%
+   with J6. At seq=128 J6 doesn't matter, but at seq=256 the geometric
+   structure becomes load-bearing.
+
+**Head count scaling (d=192, 2 layers, seq=256, rapid 10% data):**
+
+| Heads | d_head | Standard | Learned decay | Delta |
+|-------|--------|----------|---------------|-------|
+| 4 | 32* | ~3184 | ~3074 | -3.5% |
+| 6 | 32 | 1730.8 | 1676.6 | -3.1% |
+| **8** | **24** | **1777.5** | **1687.5** | **-5.1%** |
+| 12 | 16 | 1748.7 | 1693.9 | -3.1% |
+
+*d=128 fast model
+
+8 heads is the sweet spot. At 12 heads (d_head=16), attention quality degrades
+and the advantage shrinks. The optimal regime balances d_head≥24 for attention
+quality with enough heads for timescale diversity.
+
+**Model width scaling (2 layers, 8 heads, seq=256, rapid 10% data):**
+
+| d_model | Standard | Learned decay | Delta |
+|---------|----------|---------------|-------|
+| 128* | ~3184 | ~3074 | -3.5% |
+| 192 | 1777.5 | 1687.5 | -5.1% |
+| **256** | **1318.3** | **1232.5** | **-6.5%** |
+| 384 | 1026.9 | 964.3 | -6.1% |
+
+*4 heads (fast model)
+
+**The geometry advantage grows with width and plateaus at ~6%.** Wider models
+exploit the Gram's complementary signal better, peaking at d=256 (-6.5%)
+and holding at d=384 (-6.1%). The plateau makes sense: the 6×6 Gram has
+21 independent parameters — its information capacity is finite.
+
+This confirms the Gram provides genuinely useful structural information
+that standard attention alone cannot compute. The ~6% ceiling corresponds
+to the geometric capacity of a rank-6 symmetric matrix.
+
+**Depth scaling (d=192, 8 heads):**
+
+| Layers | Standard | Learned decay | Delta |
+|--------|----------|---------------|-------|
+| 2 | 1777.5 | 1687.5 | -5.1% |
+| 4 | 1731.3 | 1673.3 | -3.3% |
+
+Deeper models show smaller advantage — they already capture structural
+information through their multiple attention layers.
+
+**Needs full-data verification at seq=256.**
 
 #### 3g. Gram eigenstructure as features
 
@@ -419,6 +509,45 @@ nearly identical across all dimensions.
 captures most useful geometric structure. The information bottleneck
 is the model's ability to USE the geometric signal, not the Gram's
 ability to ENCODE it. Higher Grassmannians add marginal value.
+
+**Fast 2-layer screening (10 epochs, from scratch, ROCm AMD 8060S):**
+
+| Model | Best PPL | Params | J matrix |
+|-------|----------|--------|----------|
+| Standard (no geometry) | 403.9 | 6,846,080 | — |
+| Online mem G(2,4) | **400.5** | 6,896,528 | J6 (Hodge) |
+| Online mem G(2,6) | 403.7 | 6,904,720 | Identity |
+
+| Online mem G(2,4) no-J6 | **400.8** | 6,896,528 | Identity |
+
+**Finding**: J6 is NOT the key ingredient (400.5 vs 400.8, noise-level
+difference). The exterior product structure itself provides the geometric
+signal — the specific bilinear form (J6 vs identity) is irrelevant.
+
+However, G(2,6) with 15D coordinates (403.7) matches standard (403.9)
+and loses the G(2,4) advantage. Higher dimensionality actively hurts.
+
+**Why G(2,4) works but G(2,6) doesn't**: The 4D→6D exterior product is a
+compact nonlinear feature map (quadratic interactions of 4 coordinates =
+6 features). Going to 6D→15D creates 15 features from 6 coordinates,
+but the extra dimensions are redundant — the model only has 4 heads with
+32 dims each to learn structure. The 6D sweet spot balances expressivity
+with learnability.
+
+Full sweep (fast 2-layer, 10 epochs, ROCm):
+
+| Model | Best PPL | Plücker dim |
+|-------|----------|-------------|
+| Standard | 403.9 | — |
+| G(2,4) + J6 | **400.5** | 6D |
+| G(2,4) + identity | 400.8 | 6D |
+| G(2,5) + identity | 401.0 | 10D |
+| G(2,6) + identity | 403.7 | 15D |
+
+**Lesson**: G(2,4) is the sweet spot. Higher Grassmannians dilute the
+signal. The geometry's value is in the exterior product as a compact
+nonlinear feature map (4 coords → 6 features), not in the Plücker inner
+product or higher-dimensional Grassmannian structure.
 
 ## Active: Retrieval and reasoning
 
