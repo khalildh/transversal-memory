@@ -287,12 +287,15 @@ class MultiScaleMemoryAttention(nn.Module):
 
 
 class GramMLPAttention(nn.Module):
-    """Gram matrix with MLP readout — vector-valued memory instead of scalar gate.
+    """Query-conditioned Gram MLP: "what does the Gram mean for THIS query?"
 
-    Instead of collapsing the Gram to a scalar score, extracts the upper triangle
-    (21 features for 6×6) and projects through a small MLP to produce a d_head
-    vector per head. This lets the model read rich structure from the Gram rather
-    than getting a single yes/no gate.
+    The scalar gate in OnlineMemoryAttention computes p·(★M·q) — the Gram is
+    queried by the current token's line, so different tokens get different
+    readouts. A naive MLP on upper_triangle(M) loses this query-specificity.
+
+    Fix: project the query into Gram-feature space, multiply elementwise with
+    Gram features before the MLP. The MLP then answers "what does the Gram
+    mean for this query" rather than "what does the Gram mean in general."
     """
     def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, **kw):
         super().__init__()
@@ -310,7 +313,11 @@ class GramMLPAttention(nn.Module):
         self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
         self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
 
-        # MLP: upper triangle of Gram → d_head vector per head
+        # Query → Gram feature space for conditioning
+        self.q_to_gram = nn.Linear(self.d_head, n_gram)
+        # LayerNorm on Gram features (scale drifts as M accumulates)
+        self.gram_ln = nn.LayerNorm(n_gram)
+        # MLP: query-conditioned Gram features → d_head vector per head
         self.gram_mlp = nn.Sequential(
             nn.Linear(n_gram, self.d_head),
             nn.GELU(),
@@ -361,11 +368,16 @@ class GramMLPAttention(nn.Module):
             grams[:, :, t] = M
             M = self.decay * M + outer[:, :, t]
 
-        # Extract upper triangle → (B, H, T, n_gram_features)
+        # Extract upper triangle → (B, H, T, n_gram)
         gram_features = grams[:, :, :, self.triu_i, self.triu_j]
+        gram_features = self.gram_ln(gram_features)
+
+        # Query-conditioned readout: q projects into Gram space, gates features
+        q_proj = self.q_to_gram(q)  # (B, H, T, n_gram)
+        conditioned = gram_features * q_proj  # elementwise: "Gram for THIS query"
 
         # MLP readout → (B, H, T, dh)
-        mem_out = self.gram_mlp(gram_features)
+        mem_out = self.gram_mlp(conditioned)
 
         # Input-dependent gate per head
         gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
@@ -375,6 +387,101 @@ class GramMLPAttention(nn.Module):
         combined = seq_out + gate * mem_out
         combined = combined.transpose(1, 2).reshape(B, T, D)
         return self.out(combined)
+
+
+class GramRouteAttention(nn.Module):
+    """Incidence-weighted value routing — vector readout from geometry.
+
+    Like online_mem but instead of collapsing incidence to a scalar gate,
+    uses normalized incidence² as attention weights to route separate memory
+    values. Additive (doesn't compete with standard attention).
+
+    This is the "richer readout" version: each position gets a different
+    vector from memory based on which past tokens are geometrically related
+    to its query line. online_mem asks "how related am I to the past?"
+    (scalar); this asks "what from the past is related to me?" (vector).
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)  # separate V for memory path
+        self.mem_gate = nn.Linear(d_model, n_heads)  # per-head scalar gate
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        # Standard attention
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # Compute incidence matrix (same as online_mem)
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        pd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, pd)
+        w2 = self.W2_write(x).reshape(B, T, H, pd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, pd)
+        r2 = self.W2_read(x).reshape(B, T, H, pd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)
+        read_h = read_lines.permute(0, 2, 1, 3)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)
+        incidence = read_h @ Jwrite_h.transpose(-1, -2)  # (B, H, T, T)
+        incidence_sq = incidence ** 2
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        if self.decay != 1.0:
+            positions = torch.arange(T, device=x.device, dtype=x.dtype)
+            weights = self.decay ** (positions.unsqueeze(1) - positions.unsqueeze(0))
+            weights = weights.tril(diagonal=-1)
+            incidence_sq = incidence_sq * weights.unsqueeze(0).unsqueeze(0)
+
+        # Normalize incidence to attention-like weights
+        scale = self.mem_scale.reshape(1, H, 1, 1)
+        inc_logits = incidence_sq * scale
+        inc_logits = inc_logits.masked_fill(causal, float('-inf'))
+        # Safe softmax: for t=0 all values are -inf, producing uniform/zero
+        # Clamp to prevent NaN from all-inf rows
+        inc_attn = F.softmax(inc_logits, dim=-1)
+        inc_attn = inc_attn.nan_to_num(0.0)  # t=0 has no past → zero weights
+
+        # Route memory values using geometric attention
+        mem_v = self.mem_value(x).reshape(B, T, H, dh).permute(0, 2, 1, 3)  # (B, H, T, dh)
+        mem_out = (inc_attn @ mem_v).transpose(1, 2).reshape(B, T, D)  # (B, T, D)
+
+        # Per-head gate (starts small)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        gate = gate.mean(dim=-1, keepdim=True)  # (B, T, 1)
+
+        return self.out(seq_out + gate * mem_out)
 
 
 class DualPathAttention(nn.Module):
@@ -1467,6 +1574,7 @@ ATTN_CLASSES = {
     "inc_bias": IncidenceBiasAttention,
     "multi_write": MultiWriteMemoryAttention,
     "inc_route": IncidenceRouteAttention,
+    "gram_route": GramRouteAttention,
 }
 
 class Block(nn.Module):
