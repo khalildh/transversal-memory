@@ -684,6 +684,101 @@ plausible inference.
 - Requires TDGA checkpoint + sentence-transformers (external dependencies)
 - 384D→4D projection is lossy; geometry works because ensemble (50 seeds) recovers info
 
+## Active: Geometric induction head hypothesis
+
+### Background (Olsson et al., 2022)
+
+Induction heads are the 2-head circuit in transformers that implement in-context
+pattern completion: find a previous occurrence of the current token, then predict
+that the next token will be whatever followed that token before. Key facts:
+
+- Induction heads **require at least 2 layers** (one head to match, one to copy)
+- A 1-layer model structurally cannot form induction heads
+- During training, induction heads appear in a sharp **phase transition** where
+  most in-context learning ability is acquired simultaneously
+- They implement "fuzzy" pattern matching — not just exact token copies but
+  abstract sequence completion (N-gram and concept-level induction)
+
+### Connection to Gram memory
+
+The depth scaling result from §3i-b is the key evidence:
+
+| Layers | Geometry gap |
+|--------|-------------|
+| 1      | -10.1%      |
+| 2      | -3.6%       |
+| 3      | -0.9%       |
+| 4      | -0.1%       |
+
+**Hypothesis**: The online Gram memory provides a continuous, geometric analogue
+of induction head behavior. A 1-layer model cannot form induction heads, so the
+Gram memory fills that gap — providing multi-hop relational composition that
+normally requires depth. Deeper models grow their own induction circuits and
+the Gram becomes redundant.
+
+The Gram memory operates at a higher abstraction level than token-level induction:
+it accumulates relational structure between bigrams (Plücker lines from token
+pairs), not token identities. This makes it closer to **concept-level induction
+heads** than standard prefix-matching ones.
+
+### Testable predictions
+
+1. **Selective benefit on induction positions**: Gram memory should reduce loss
+   specifically on tokens where the correct prediction could be made by pattern-
+   matching against earlier context ("induction positions"), not uniformly.
+
+2. **Training dynamics**: The 1-layer+Gram model should skip or smooth the
+   loss bump that normally corresponds to induction head formation during training.
+
+3. **Scaling**: If Gram memory genuinely substitutes for induction heads, the
+   benefit should scale — not just help tiny models but any model that is
+   induction-head-limited (undertrained, shallow, or handling novel patterns).
+
+### Experiment: exp_induction_test.py
+
+Tests prediction 1 directly. For each position t in validation data, classify as:
+- **Induction position**: token x[t] appeared at earlier position s, and the
+  token following s matches the correct next-token y[t]
+- **Non-induction position**: all other positions
+
+Compare per-token loss at each position type for standard vs online_mem models.
+If Gram memory selectively helps on induction positions at 1 layer but not at
+4 layers, that's direct evidence for the geometric induction head hypothesis.
+
+### Vector-valued neural networks (V-Nets) connection
+
+The Gram memory is already vector-valued in spirit — the Plücker embedding
+p = a ∧ b takes two vectors and produces a 6-vector encoding the line they span
+in P³. The Gram matrix M = Σ pᵢ⊗pᵢ is a second-order statistic of geometric
+vectors. This is structurally similar to V-Net architectures where neurons
+operate on vectors rather than scalars.
+
+V-Net integration opportunities:
+- **Learned projections into Plücker space**: Replace fixed linear W₁, W₂ with
+  equivariant vector neuron layers that preserve orientation and relational
+  direction. Current finding (learned ≈ random projections) suggests the linear
+  projection isn't extracting geometric structure; equivariant layers might.
+- **Richer Gram computation**: V-Net layers could compose Plücker lines with
+  learned rotations/reflections/gating rather than just linear superposition.
+- **Natural Grassmannian generalization**: V-Nets in ℝ⁵ or ℝ⁶ map directly
+  onto G(2,6), G(2,7) without deriving each Hodge dual by hand. However,
+  G(2,4) was shown to be the sweet spot (§4), so this may not help.
+
+### Two-path architecture with attention
+
+The most promising integration would combine temporal (triadic) memory for exact
+sequence recall with transversal memory for generative retrieval, connected by
+attention:
+
+1. **Router attention**: soft gate between temporal (exact recall) and transversal
+   (generative) paths, learned from query + confidence signals
+2. **Attention over Gram eigenvectors**: expose principal relational axes as
+   additional memory keys that standard attention can attend to (addresses the
+   scalar gate's limitation of answering "how much structure?" but not "which
+   structure is relevant to this query?")
+3. **Cross-attention**: transversal candidates scored against temporal store for
+   consistency — temporal memory as a prior on the generative path
+
 ## Open questions
 
 - **Geometry only helps with weak embeddings**: Can geometry add to neural embedding
@@ -693,3 +788,8 @@ plausible inference.
   in 32D without lossy projection to capture useful higher-order interactions?
 - **Sequence prediction via transversals**: Can geometric constraints predict
   next tokens in BPE-tokenized text?
+- **Geometric induction heads**: Does Gram memory selectively help on induction-
+  type positions (pattern completion), or does it provide a general context
+  signal? (Test: exp_induction_test.py)
+- **V-Net projections**: Can equivariant vector neuron layers learn better
+  projections into Plücker space than linear W₁, W₂?
