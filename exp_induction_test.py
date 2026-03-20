@@ -8,26 +8,27 @@ I see A again, so predict B." They require at least 2 layers to form (one head t
 copy, one to match). A 1-layer model structurally cannot form induction heads.
 
 If Gram memory substitutes for induction heads, it should:
-  1. Help most in 1-layer models (confirmed: -10.1% PPL)
+  1. Help most in 1-layer models (confirmed: -10.1% PPL on WikiText-2)
   2. Selectively help on "induction positions" — tokens where the correct next
      token could be predicted by pattern-matching against earlier context
   3. Show diminishing benefit at 4 layers (confirmed: -0.1% PPL)
 
-This script measures per-token loss broken down by token type:
-  - "Induction positions": token t where token[t] appeared at some earlier
-    position s, and token[s+1] == token[t+1] (pattern completion opportunity)
-  - "Non-induction positions": all other positions
+Methodology (follows Olsson et al.):
+  - Generate sequences with REPEATED random token subsequences:
+    [random prefix] [A B C D ...] [random middle] [A B C D ...]
+  - The second occurrence of the repeated pattern creates "induction positions"
+    where a model that remembers the first occurrence can predict the next token
+  - A 1-layer model cannot form induction heads to exploit this
+  - If Gram memory helps specifically on these positions, it's acting as a
+    geometric induction head
 
-If Gram memory selectively reduces loss on induction positions relative to
-non-induction positions, that's direct evidence for the geometric induction
-head hypothesis.
+No external data or tokenizer needed — pure synthetic sequences.
 
 Usage:
   uv run python exp_induction_test.py                  # 1-layer analysis
   uv run python exp_induction_test.py --layers 2       # 2-layer comparison
   uv run python exp_induction_test.py --layers 4       # 4-layer comparison
-  uv run python exp_induction_test.py --all             # sweep 1,2,4 layers
-  uv run python exp_induction_test.py --skip-train      # eval only (needs checkpoints)
+  uv run python exp_induction_test.py --all            # sweep 1,2,4 layers
 """
 
 import os
@@ -36,8 +37,6 @@ os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tiktoken
-import pyarrow.parquet as pq
 import time
 import math
 import argparse
@@ -48,20 +47,104 @@ from itertools import combinations
 # ── Config ───────────────────────────────────────────────────────────────────
 
 class Config:
-    d_model = 96      # small for 1-layer (matches ideas.md 1-layer experiments)
+    vocab_size = 64     # small vocab — patterns are learnable
+    d_model = 96
     n_heads = 4
     n_layers = 1
     dropout = 0.1
     seq_len = 128
-    batch_size = 128
-    n_epochs = 15      # train to convergence for clean analysis
+    batch_size = 64
+    n_epochs = 50
     lr = 3e-4
     grad_clip = 1.0
-    warmup_steps = 50
-    patience = 3
-    min_delta = 1.0
-    data_dir = Path("data/wikitext")
-    cache_dir = Path("data/cache")
+    warmup_steps = 200
+    patience = 10
+    min_delta = 0.1
+
+# ── Synthetic data with induction patterns ───────────────────────────────────
+
+def make_bigram_matrix(vocab_size, seed=42):
+    """Create a fixed bigram transition matrix with ~5 successors per token."""
+    bigram_probs = torch.zeros(vocab_size, vocab_size)
+    for t in range(vocab_size):
+        successors = torch.randint(0, vocab_size, (5,),
+                                   generator=torch.Generator().manual_seed(seed + t))
+        bigram_probs[t, successors] = 1.0
+    bigram_probs = bigram_probs + 0.01
+    bigram_probs = bigram_probs / bigram_probs.sum(dim=1, keepdim=True)
+    return bigram_probs
+
+
+def generate_bigram_sequences(n_seqs, seq_len, bigram_probs, seed=42):
+    """Generate pure bigram sequences for training."""
+    rng = torch.Generator().manual_seed(seed)
+    vocab_size = bigram_probs.shape[0]
+    x_all = torch.zeros(n_seqs, seq_len + 1, dtype=torch.long)
+
+    for i in range(n_seqs):
+        tok = torch.randint(0, vocab_size, (1,), generator=rng).item()
+        x_all[i, 0] = tok
+        for j in range(1, seq_len + 1):
+            tok = torch.multinomial(bigram_probs[tok], 1, generator=rng).item()
+            x_all[i, j] = tok
+
+    y = x_all[:, 1:seq_len + 1].contiguous()
+    x = x_all[:, :seq_len].contiguous()
+    return x, y
+
+
+def generate_mixed_training_data(n_seqs, seq_len, bigram_probs, repeat_frac=0.5,
+                                  seed=42):
+    """Generate training data mixing pure bigram and repeated-half sequences.
+
+    repeat_frac of sequences have structure: [bigram half] [exact copy]
+    The rest are pure bigram sequences.
+
+    This gives the model the OPPORTUNITY to learn induction (from the repeated
+    sequences) while also learning the base bigram distribution.
+    """
+    rng = torch.Generator().manual_seed(seed)
+    vocab_size = bigram_probs.shape[0]
+    half = seq_len // 2
+
+    x_all = torch.zeros(n_seqs, seq_len + 1, dtype=torch.long)
+    induction_mask = torch.zeros(n_seqs, seq_len, dtype=torch.bool)
+    is_repeat_seq = torch.zeros(n_seqs, dtype=torch.bool)
+
+    for i in range(n_seqs):
+        # Decide if this is a repeated or pure bigram sequence
+        do_repeat = (torch.rand(1, generator=rng).item() < repeat_frac)
+
+        # Generate tokens from bigram distribution
+        tok = torch.randint(0, vocab_size, (1,), generator=rng).item()
+        tokens = [tok]
+        for _ in range(seq_len):
+            tok = torch.multinomial(bigram_probs[tok], 1, generator=rng).item()
+            tokens.append(tok)
+
+        if do_repeat:
+            # Overwrite second half with copy of first half
+            first_half = tokens[:half]
+            for j in range(half):
+                tokens[half + j] = first_half[j]
+            # Make the target after the second half also match
+            if 2 * half < seq_len + 1:
+                tokens[2 * half] = first_half[0]
+
+            # Mark induction positions in the second half
+            # (position half+1 through half+half-1 in x-space, since target
+            # at position t is tokens[t+1])
+            for j in range(1, half):
+                if half + j < seq_len:
+                    induction_mask[i, half + j] = True
+            is_repeat_seq[i] = True
+
+        x_all[i] = torch.tensor(tokens[:seq_len + 1], dtype=torch.long)
+
+    y = x_all[:, 1:seq_len + 1].contiguous()
+    x = x_all[:, :seq_len].contiguous()
+    return x, y, induction_mask, is_repeat_seq
+
 
 # ── Plücker primitives ──────────────────────────────────────────────────────
 
@@ -105,7 +188,7 @@ class StandardAttention(nn.Module):
 
 
 class OnlineMemoryAttention(nn.Module):
-    """Online Gram memory with scalar gate (current best)."""
+    """Online Gram memory with scalar gate."""
     def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, **kw):
         super().__init__()
         self.n_heads = n_heads
@@ -228,115 +311,13 @@ class LM(nn.Module):
     def count_params(self):
         return sum(p.numel() for p in self.parameters())
 
-# ── Data ─────────────────────────────────────────────────────────────────────
-
-_token_cache = {}
-
-def load_tokens_cached(split, cfg):
-    if split in _token_cache:
-        return _token_cache[split]
-    cache_file = cfg.cache_dir / f"wikitext_{split}_tokens.pt"
-    if cache_file.exists():
-        tokens = torch.load(cache_file, weights_only=True)
-    else:
-        enc = tiktoken.get_encoding("gpt2")
-        fname = {"train": "train.parquet", "val": "val.parquet", "test": "test.parquet"}
-        table = pq.read_table(cfg.data_dir / fname[split])
-        text = "\n".join(t for t in table['text'].to_pylist() if t.strip())
-        tokens = torch.tensor(enc.encode(text, allowed_special=set()), dtype=torch.long)
-        cfg.cache_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(tokens, cache_file)
-        print(f"  Cached {split} tokens: {len(tokens):,} -> {cache_file}")
-    _token_cache[split] = tokens
-    return tokens
-
-def make_batches(data, seq_len, batch_size):
-    n = len(data) - 1
-    n_seqs = (n // seq_len // batch_size) * batch_size
-    data = data[:n_seqs * seq_len + 1]
-    x = data[:-1].reshape(n_seqs, seq_len)
-    y = data[1:].reshape(n_seqs, seq_len)
-    perm = torch.randperm(n_seqs)
-    return [(x[perm[i:i+batch_size]], y[perm[i:i+batch_size]])
-            for i in range(0, n_seqs, batch_size)
-            if i + batch_size <= n_seqs]
-
-# ── Induction position detection ─────────────────────────────────────────────
-
-def find_induction_positions(x_batch, y_batch):
-    """Identify positions where an induction head would help.
-
-    A position t is an "induction position" if:
-      - token x[t] appeared at some earlier position s (s < t)
-      - the token that followed s (i.e., x[s+1] or y[s]) equals y[t]
-        (the correct next-token prediction at position t)
-
-    This is the prefix-matching pattern that induction heads exploit:
-    ... [A] [B] ... [A] [?]  →  predict [B]
-
-    Returns a boolean mask of shape (B, T) where True = induction position.
-    """
-    B, T = x_batch.shape
-    induction_mask = torch.zeros(B, T, dtype=torch.bool)
-
-    for b in range(B):
-        x = x_batch[b]   # (T,)
-        y = y_batch[b]    # (T,) — the target (next token)
-
-        for t in range(1, T):
-            current_tok = x[t].item()
-            target_tok = y[t].item()
-
-            # Look for earlier occurrences of current_tok
-            for s in range(t):
-                if x[s].item() == current_tok and y[s].item() == target_tok:
-                    induction_mask[b, t] = True
-                    break  # one match suffices
-
-    return induction_mask
-
-
-def find_induction_positions_fast(x_batch, y_batch):
-    """Vectorized version of induction position detection.
-
-    For each position t, checks if there exists s < t such that
-    x[s] == x[t] AND y[s] == y[t]. This identifies positions where
-    copying the previous completion of the same token would be correct.
-    """
-    B, T = x_batch.shape
-    # Encode (input_token, target_token) as a single integer for fast matching
-    # Use a large multiplier to avoid collisions
-    M = 100003  # prime larger than vocab size (~50k for GPT-2)
-    combined = x_batch.long() * M + y_batch.long()  # (B, T)
-
-    induction_mask = torch.zeros(B, T, dtype=torch.bool)
-
-    for b in range(B):
-        seen = set()
-        for t in range(T):
-            key = combined[b, t].item()
-            if key in seen:
-                induction_mask[b, t] = True
-            seen.add(key)
-
-    return induction_mask
-
-
 # ── Per-token evaluation ─────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate_by_position_type(model, batches, device):
-    """Compute per-token cross-entropy loss, split by induction vs non-induction.
-
-    Returns dict with:
-      - total_loss, total_count: overall
-      - induction_loss, induction_count: loss at induction positions
-      - non_induction_loss, non_induction_count: loss at non-induction positions
-      - induction_ppl, non_induction_ppl: perplexity for each type
-    """
+def evaluate_by_position_type(model, x_batches, y_batches, mask_batches, device,
+                              vocab_size):
+    """Compute per-token loss split by induction vs non-induction positions."""
     model.eval()
-    enc = tiktoken.get_encoding("gpt2")
-    V = enc.n_vocab
 
     total_loss = 0.0
     total_count = 0
@@ -345,36 +326,34 @@ def evaluate_by_position_type(model, batches, device):
     non_induction_loss = 0.0
     non_induction_count = 0
 
-    for xb, yb in batches:
-        xb_dev, yb_dev = xb.to(device), yb.to(device)
-        logits = model(xb_dev)  # (B, T, V)
+    for xb, yb, mb in zip(x_batches, y_batches, mask_batches):
+        xb_dev = xb.to(device)
+        yb_dev = yb.to(device)
+        mb_dev = mb.to(device)
+        logits = model(xb_dev)
 
-        # Per-token loss (no reduction)
         per_token_loss = F.cross_entropy(
-            logits.reshape(-1, V), yb_dev.reshape(-1), reduction='none'
-        ).reshape(xb.shape)  # (B, T)
+            logits.reshape(-1, vocab_size), yb_dev.reshape(-1), reduction='none'
+        ).reshape(xb.shape)
 
-        # Find induction positions (on CPU for the token matching)
-        ind_mask = find_induction_positions_fast(xb, yb).to(device)
-        non_ind_mask = ~ind_mask
+        non_mb = ~mb_dev
 
-        # Accumulate
         total_loss += per_token_loss.sum().item()
         total_count += per_token_loss.numel()
 
-        induction_loss += (per_token_loss * ind_mask.float()).sum().item()
-        induction_count += ind_mask.sum().item()
+        induction_loss += (per_token_loss * mb_dev.float()).sum().item()
+        induction_count += mb_dev.sum().item()
 
-        non_induction_loss += (per_token_loss * non_ind_mask.float()).sum().item()
-        non_induction_count += non_ind_mask.sum().item()
+        non_induction_loss += (per_token_loss * non_mb.float()).sum().item()
+        non_induction_count += non_mb.sum().item()
 
     results = {
-        "total_loss": total_loss / total_count,
-        "total_ppl": math.exp(min(total_loss / total_count, 20)),
+        "total_loss": total_loss / max(total_count, 1),
+        "total_ppl": math.exp(min(total_loss / max(total_count, 1), 20)),
         "total_count": total_count,
         "induction_count": induction_count,
         "non_induction_count": non_induction_count,
-        "induction_frac": induction_count / total_count if total_count > 0 else 0,
+        "induction_frac": induction_count / max(total_count, 1),
     }
 
     if induction_count > 0:
@@ -400,28 +379,32 @@ def evaluate_by_position_type(model, batches, device):
 
 def get_lr(step, cfg, total_steps):
     if step < cfg.warmup_steps:
-        return cfg.lr * step / cfg.warmup_steps
+        return cfg.lr * step / max(cfg.warmup_steps, 1)
     progress = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
     return cfg.lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def train_model(attn_type, cfg, device, data_frac=0.5):
-    enc = tiktoken.get_encoding("gpt2")
-    train_data = load_tokens_cached("train", cfg)
+def make_batches_from_tensors(x, y, mask, batch_size):
+    """Split pre-generated tensors into batches."""
+    n = x.shape[0]
+    batches_x, batches_y, batches_m = [], [], []
+    for i in range(0, n, batch_size):
+        if i + batch_size <= n:
+            batches_x.append(x[i:i+batch_size])
+            batches_y.append(y[i:i+batch_size])
+            batches_m.append(mask[i:i+batch_size])
+    return batches_x, batches_y, batches_m
 
-    # Use 50% data by default for faster iteration
-    n = int(len(train_data) * data_frac)
-    train_data = train_data[:n]
-    print(f"  Using {data_frac*100:.0f}% of training data ({n:,} tokens)")
 
-    model = LM(enc.n_vocab, cfg, attn_type).to(device)
+def train_model(attn_type, cfg, device, train_x, train_y, val_x, val_y):
+    """Train a model on mixed bigram + repeated sequences."""
+    model = LM(cfg.vocab_size, cfg, attn_type).to(device)
     print(f"  {attn_type}: {model.count_params():,} params")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.01)
-    n_batches = len(make_batches(train_data, cfg.seq_len, cfg.batch_size))
+    n_batches = train_x.shape[0] // cfg.batch_size
     total_steps = n_batches * cfg.n_epochs
 
-    val_data = load_tokens_cached("val", cfg)
     best_ppl = float('inf')
     patience_counter = 0
     global_step = 0
@@ -430,86 +413,83 @@ def train_model(attn_type, cfg, device, data_frac=0.5):
     for ep in range(cfg.n_epochs):
         t0 = time.time()
         model.train()
-        batches = make_batches(train_data, cfg.seq_len, cfg.batch_size)
+
+        perm = torch.randperm(train_x.shape[0])
+        sx = train_x[perm]
+        sy = train_y[perm]
+
         ep_loss = 0.0
-        for xb, yb in batches:
+        n_batch = 0
+        for i in range(0, sx.shape[0], cfg.batch_size):
+            if i + cfg.batch_size > sx.shape[0]:
+                break
+            xb = sx[i:i+cfg.batch_size].to(device)
+            yb = sy[i:i+cfg.batch_size].to(device)
+
             lr = get_lr(global_step, cfg, total_steps)
             for pg in opt.param_groups:
                 pg['lr'] = lr
-            xb, yb = xb.to(device), yb.to(device)
-            loss = F.cross_entropy(model(xb).view(-1, enc.n_vocab), yb.view(-1))
+
+            loss = F.cross_entropy(model(xb).view(-1, cfg.vocab_size), yb.view(-1))
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
             ep_loss += loss.item()
+            n_batch += 1
             global_step += 1
-        avg = ep_loss / len(batches)
+
+        avg = ep_loss / max(n_batch, 1)
         losses.append(avg)
 
+        # Validate on pure bigram sequences (same distribution as training)
         model.eval()
         with torch.no_grad():
-            vb = make_batches(val_data, cfg.seq_len, cfg.batch_size)
-            vl = sum(F.cross_entropy(model(x.to(device)).view(-1, enc.n_vocab),
-                     y.to(device).view(-1)).item() for x, y in vb) / len(vb)
+            vl = 0.0
+            n_vb = 0
+            for i in range(0, val_x.shape[0], cfg.batch_size):
+                if i + cfg.batch_size > val_x.shape[0]:
+                    break
+                vx = val_x[i:i+cfg.batch_size].to(device)
+                vy = val_y[i:i+cfg.batch_size].to(device)
+                vl += F.cross_entropy(model(vx).view(-1, cfg.vocab_size),
+                                      vy.view(-1)).item()
+                n_vb += 1
+            vl /= max(n_vb, 1)
         ppl = math.exp(min(vl, 20))
         ppls.append(ppl)
 
         elapsed = time.time() - t0
         improved = " *" if ppl < best_ppl - cfg.min_delta else ""
-        print(f"    ep {ep+1:2d}: loss={avg:.3f}  ppl={ppl:.1f}  ({elapsed:.1f}s){improved}")
+        print(f"    ep {ep+1:2d}: loss={avg:.3f}  ppl={ppl:.1f}  lr={lr:.2e}  ({elapsed:.1f}s){improved}")
 
         if ppl < best_ppl - cfg.min_delta:
             best_ppl = ppl
             patience_counter = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             patience_counter += 1
             if patience_counter >= cfg.patience:
                 print(f"    Early stopping (no improvement for {cfg.patience} epochs)")
                 break
 
-    # Save checkpoint
-    ckpt_dir = Path("checkpoints")
-    ckpt_dir.mkdir(exist_ok=True)
-    ckpt_name = f"induction_{attn_type}_{cfg.n_layers}L.pt"
-    torch.save({
-        "model": model.state_dict(),
-        "type": attn_type,
-        "losses": losses,
-        "ppls": ppls,
-        "vocab": enc.n_vocab,
-        "n_layers": cfg.n_layers,
-        "d_model": cfg.d_model,
-        "n_heads": cfg.n_heads,
-    }, ckpt_dir / ckpt_name)
-    print(f"  Saved {ckpt_name}")
+    # Restore best model
+    if best_ppl < float('inf'):
+        model.load_state_dict(best_state)
+        model = model.to(device)
 
+    print(f"  Best bigram PPL: {best_ppl:.1f}")
     return model, losses, ppls
 
 
-def load_model(attn_type, cfg, device):
-    """Load a trained model from checkpoint."""
-    ckpt_name = f"induction_{attn_type}_{cfg.n_layers}L.pt"
-    ckpt_path = Path("checkpoints") / ckpt_name
-    if not ckpt_path.exists():
-        return None
+# ── Main analysis ────────────────────────────────────────────────────────────
 
-    enc = tiktoken.get_encoding("gpt2")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    model = LM(ckpt["vocab"], cfg, attn_type).to(device)
-    model.load_state_dict(ckpt["model"])
-    print(f"  Loaded {ckpt_name} (best PPL: {min(ckpt['ppls']):.1f})")
-    return model
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-def run_analysis(n_layers, device, skip_train=False, data_frac=0.5):
+def run_analysis(n_layers, device):
     """Train standard + online_mem at given depth, then do induction analysis."""
     cfg = Config()
     cfg.n_layers = n_layers
 
-    # Scale model size with depth (match ideas.md experiments)
+    # Scale model size with depth
     if n_layers == 1:
         cfg.d_model = 96
         cfg.n_heads = 4
@@ -524,31 +504,53 @@ def run_analysis(n_layers, device, skip_train=False, data_frac=0.5):
     print(f"  INDUCTION HEAD ANALYSIS: {n_layers}-layer, d={cfg.d_model}, h={cfg.n_heads}")
     print(f"{'='*60}")
 
-    enc = tiktoken.get_encoding("gpt2")
-    val_data = load_tokens_cached("val", cfg)
-    val_batches = make_batches(val_data, cfg.seq_len, cfg.batch_size)
+    # Create shared bigram distribution
+    bigram_probs = make_bigram_matrix(cfg.vocab_size, seed=42)
+    entropy = -(bigram_probs * (bigram_probs + 1e-10).log()).sum(dim=1).mean().item()
+    print(f"  Bigram entropy: {entropy:.2f} nats -> theoretical PPL floor: {math.exp(entropy):.1f}")
+    print(f"  (On induction positions, optimal PPL = 1.0 if model can copy)")
+
+    # Training data: 50% repeated-half, 50% pure bigram
+    n_train = cfg.batch_size * 128
+    n_val = cfg.batch_size * 16
+
+    print(f"  Generating {n_train} training sequences (50% repeated, 50% bigram)...")
+    train_x, train_y, train_mask, train_repeat = generate_mixed_training_data(
+        n_train, cfg.seq_len, bigram_probs, repeat_frac=0.5, seed=42)
+    print(f"    Repeated sequences: {train_repeat.sum().item()}/{n_train}")
+
+    # Validation: ALL repeated-half sequences (to maximize induction signal)
+    print(f"  Generating {n_val} validation sequences (all repeated halves)...")
+    val_x, val_y, val_mask, _ = generate_mixed_training_data(
+        n_val, cfg.seq_len, bigram_probs, repeat_frac=1.0, seed=123)
+
+    ind_count = val_mask.sum().item()
+    ind_total = val_mask.numel()
+    print(f"  Val induction positions: {ind_count:,} / {ind_total:,} ({ind_count/ind_total*100:.1f}%)")
+
+    val_bx, val_by, val_bm = make_batches_from_tensors(val_x, val_y, val_mask,
+                                                         cfg.batch_size)
 
     results = {}
 
     for attn_type in ["standard", "online_mem"]:
         print(f"\n  --- {attn_type} ---")
 
-        if skip_train:
-            model = load_model(attn_type, cfg, device)
-            if model is None:
-                print(f"  No checkpoint found for {attn_type} {n_layers}L, training...")
-                model, _, _ = train_model(attn_type, cfg, device, data_frac=data_frac)
-        else:
-            model, _, _ = train_model(attn_type, cfg, device, data_frac=data_frac)
+        # Train on mixed data
+        model, _, ppls = train_model(attn_type, cfg, device,
+                                     train_x, train_y, val_x, val_y)
 
-        # Per-token analysis
-        print(f"\n  Evaluating per-token loss by position type...")
-        r = evaluate_by_position_type(model, val_batches, device)
+        # Evaluate per-token on validation (repeated-half sequences)
+        print(f"  Evaluating per-token loss by position type...")
+        r = evaluate_by_position_type(model, val_bx, val_by, val_bm, device,
+                                      cfg.vocab_size)
+        r["best_val_ppl"] = min(ppls)
         results[attn_type] = r
 
-        print(f"    Total PPL:          {r['total_ppl']:.1f}")
-        print(f"    Induction PPL:      {r['induction_ppl']:.1f}  ({r['induction_count']:,} positions, {r['induction_frac']*100:.1f}%)")
-        print(f"    Non-induction PPL:  {r['non_induction_ppl']:.1f}  ({r['non_induction_count']:,} positions)")
+        print(f"    Best val PPL:       {r['best_val_ppl']:.2f}")
+        print(f"    Total PPL:          {r['total_ppl']:.2f}  (per-token eval)")
+        print(f"    Induction PPL:      {r['induction_ppl']:.2f}  ({r['induction_count']:,} pos, {r['induction_frac']*100:.1f}%)")
+        print(f"    Non-induction PPL:  {r['non_induction_ppl']:.2f}  ({r['non_induction_count']:,} pos)")
 
         del model
         if torch.cuda.is_available():
@@ -563,7 +565,9 @@ def run_analysis(n_layers, device, skip_train=False, data_frac=0.5):
     mem = results["online_mem"]
 
     total_delta = (mem["total_ppl"] - std["total_ppl"]) / std["total_ppl"] * 100
-    ind_delta = (mem["induction_ppl"] - std["induction_ppl"]) / std["induction_ppl"] * 100 if not math.isnan(std["induction_ppl"]) else float('nan')
+    ind_delta = float('nan')
+    if not math.isnan(std["induction_ppl"]) and std["induction_ppl"] > 0:
+        ind_delta = (mem["induction_ppl"] - std["induction_ppl"]) / std["induction_ppl"] * 100
     non_delta = (mem["non_induction_ppl"] - std["non_induction_ppl"]) / std["non_induction_ppl"] * 100
 
     print(f"  {'Position type':<20} {'Standard':>10} {'Online mem':>10} {'Delta':>8}")
@@ -587,6 +591,8 @@ def run_analysis(n_layers, device, skip_train=False, data_frac=0.5):
 
     return {
         "n_layers": n_layers,
+        "d_model": cfg.d_model,
+        "n_heads": cfg.n_heads,
         "standard": std,
         "online_mem": mem,
         "total_delta_pct": total_delta,
@@ -600,8 +606,6 @@ def main():
     parser = argparse.ArgumentParser(description="Induction head analysis for Gram memory")
     parser.add_argument("--layers", type=int, default=1, help="Number of layers (default: 1)")
     parser.add_argument("--all", action="store_true", help="Sweep 1, 2, 4 layers")
-    parser.add_argument("--skip-train", action="store_true", help="Load from checkpoints only")
-    parser.add_argument("--data-frac", type=float, default=0.5, help="Training data fraction")
     args = parser.parse_args()
 
     device = torch.device(
@@ -618,7 +622,7 @@ def main():
 
     all_results = []
     for nl in layer_configs:
-        r = run_analysis(nl, device, skip_train=args.skip_train, data_frac=args.data_frac)
+        r = run_analysis(nl, device)
         all_results.append(r)
 
     # Summary table across depths
@@ -626,7 +630,7 @@ def main():
         print(f"\n\n{'='*60}")
         print(f"  DEPTH SWEEP SUMMARY")
         print(f"{'='*60}")
-        print(f"  {'Layers':<8} {'Total Δ':>10} {'Induction Δ':>12} {'Non-ind Δ':>10} {'Selectivity':>12}")
+        print(f"  {'Layers':<8} {'Total D':>10} {'Induction D':>12} {'Non-ind D':>10} {'Selectivity':>12}")
         print(f"  {'-'*54}")
         for r in all_results:
             print(f"  {r['n_layers']:<8} {r['total_delta_pct']:>+9.1f}% {r['induction_delta_pct']:>+11.1f}% "
@@ -637,7 +641,9 @@ def main():
         print(f"  zero at 4 layers (where real induction heads can form).")
 
     # Save results
-    results_path = Path("checkpoints/induction_analysis.json")
+    ckpt_dir = Path("checkpoints")
+    ckpt_dir.mkdir(exist_ok=True)
+    results_path = ckpt_dir / "induction_analysis.json"
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2, default=str)
     print(f"\n  Results saved to {results_path}")
