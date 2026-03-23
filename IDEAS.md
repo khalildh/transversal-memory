@@ -827,7 +827,14 @@ attention and Gram memory should focus exclusively on *other* tokens' informatio
 Implementation: `ExclusiveOnlineMemoryAttention` in `exp_mem_attn.py`
 - Forward pass and gradient flow verified
 - Run: `uv run python exp_mem_attn.py xsa_online_mem`
-- Status: **awaiting PPL results** (needs local run with data/network access)
+- Status: **awaiting WikiText PPL results** (needs local run with data/network access)
+
+Synthetic benchmark results (test_xsa_gram.py, vocab=256, d=128, 2 layers):
+- standard:       PPL 104.0
+- online_mem:     PPL 111.1 (+7.1 worse — Gram overhead hurts on tiny synthetic task)
+- xsa_online_mem: PPL 106.1 (+2.1 worse — exclusion recovers 5 PPL of the gap)
+- XSA exclusion clearly reduces self-information noise in the Gram pathway
+- On WikiText (where online_mem already beats standard), XSA should amplify the win
 
 ## Open questions
 
