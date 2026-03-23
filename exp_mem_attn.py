@@ -294,6 +294,125 @@ class OnlineMemoryAttention(nn.Module):
 
         return self.out(combined)
 
+# ── Exclusive Online Gram Memory attention (XSA + geometric exclusion) ────
+
+class ExclusiveOnlineMemoryAttention(nn.Module):
+    """
+    Applies the Exclusive Self Attention (XSA) idea to both standard Q·K
+    attention AND the Plücker Gram memory pathway.
+
+    Two exclusion mechanisms:
+    1. XSA on Q·K: project out the self-value direction from attention output,
+       so attention focuses purely on contextual (non-self) information.
+    2. Geometric exclusion on Gram: project out the self-write Plücker direction
+       from read lines before computing incidence, so the Gram memory only
+       captures relational structure orthogonal to the current token's geometry.
+
+    Motivation: the residual connection already carries self-information to the
+    FFN, so both attention and Gram memory should focus on *other* tokens.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+
+        # Standard Q/K/V
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+
+        # Plücker projections for memory write/read (per head)
+        self.W1_write = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, 4 * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, 4 * n_heads, bias=False)
+
+        # Memory value projection (what gets read out)
+        self.mem_value = nn.Linear(d_model, d_model)
+        # Gate
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        # Scale for memory score
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        self.register_buffer('J6', _J6)
+
+    def forward(self, x, **kwargs):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        # === Standard attention with XSA ===
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        attn_out = (std_attn @ v)  # (B, H, T, dh)
+
+        # XSA: project out self-value direction from attention output
+        # v_self[b,h,t,:] is the value vector for token t
+        # Remove its direction from attn_out[b,h,t,:]
+        v_norm_sq = (v * v).sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        self_proj = (attn_out * v).sum(dim=-1, keepdim=True) * v / v_norm_sq
+        attn_out = attn_out - self_proj
+
+        seq_out = attn_out.transpose(1, 2).reshape(B, T, D)
+
+        # === Online memory with geometric exclusion ===
+        # Write lines from bigrams [x_{t-1}, x_t]
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
+        w2 = self.W2_write(x).reshape(B, T, H, 4)
+        write_lines = exterior(w1, w2)  # (B, T, H, 6)
+
+        # Read lines from current token
+        r1 = self.W1_read(x).reshape(B, T, H, 4)
+        r2 = self.W2_read(x).reshape(B, T, H, 4)
+        read_lines = exterior(r1, r2)  # (B, T, H, 6)
+
+        # Compute J6-transformed write lines
+        J = self.J6
+        J_write = torch.einsum('bthi,ij->bthj', write_lines, J)  # (B, T, H, 6)
+
+        # Geometric exclusion: project out self-write direction from read lines
+        # For each position t, remove the component of read_t along J_write_t
+        # This forces Gram scoring to only capture relational structure
+        # orthogonal to the current token's own Plücker direction
+        read_h = read_lines.permute(0, 2, 1, 3)    # (B, H, T, 6)
+        Jwrite_h = J_write.permute(0, 2, 1, 3)     # (B, H, T, 6)
+
+        # Project out: read_excl = read - <read, Jw> / <Jw, Jw> * Jw
+        Jw_norm_sq = (Jwrite_h * Jwrite_h).sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        read_on_Jw = (read_h * Jwrite_h).sum(dim=-1, keepdim=True)
+        read_excl = read_h - (read_on_Jw / Jw_norm_sq) * Jwrite_h
+
+        # Incidence matrix with exclusive read lines
+        incidence = read_excl @ Jwrite_h.transpose(-1, -2)  # (B, H, T, T)
+
+        # Square it — Gram energy is sum of squared incidences
+        incidence_sq = incidence ** 2
+
+        # Causal mask: position t only sees s < t (strictly causal)
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=0).bool()
+        incidence_sq = incidence_sq.masked_fill(causal, 0.0)
+
+        # Memory score per position: sum of squared incidences with past
+        mem_score = incidence_sq.sum(dim=-1)  # (B, H, T)
+
+        # Memory value: gated by score
+        mem_val = self.mem_value(x)  # (B, T, D)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)  # (B, T, H)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate  # (B, T, H)
+        gated = gated.mean(dim=-1, keepdim=True)  # (B, T, 1)
+
+        combined = seq_out + gated * mem_val
+
+        return self.out(combined)
+
 # ── Transformer + LM ────────────────────────────────────────────────────────
 
 ATTN_CLASSES = {
@@ -301,6 +420,8 @@ ATTN_CLASSES = {
     "static_mem": lambda d, h, **kw: MemoryAugmentedAttention(
         d, h, kw.get('n_mem_slots', 32), kw.get('dropout', 0.1)),
     "online_mem": lambda d, h, **kw: OnlineMemoryAttention(
+        d, h, kw.get('dropout', 0.1), kw.get('decay', 0.99)),
+    "xsa_online_mem": lambda d, h, **kw: ExclusiveOnlineMemoryAttention(
         d, h, kw.get('dropout', 0.1), kw.get('decay', 0.99)),
 }
 
@@ -445,7 +566,7 @@ def run_variant(variant, cfg, device):
     attn_kw = {}
     if variant == "static_mem":
         attn_kw = {"n_mem_slots": cfg.n_mem_slots}
-    elif variant == "online_mem":
+    elif variant in ("online_mem", "xsa_online_mem"):
         attn_kw = {"decay": cfg.mem_decay}
 
     print("\n  Training standard baseline...")
@@ -467,9 +588,10 @@ def run_variant(variant, cfg, device):
     print(f"  {'Final val PPL':20s} {std_p[-1]:>10.1f} {var_p[-1]:>10.1f}")
 
     # Report memory-specific parameters
-    if variant == "online_mem":
+    if variant in ("online_mem", "xsa_online_mem"):
+        target_cls = (OnlineMemoryAttention, ExclusiveOnlineMemoryAttention)
         for name, mod in var.named_modules():
-            if isinstance(mod, OnlineMemoryAttention):
+            if isinstance(mod, target_cls):
                 mem_params = sum(p.numel() for n, p in mod.named_parameters()
                                if 'write' in n or 'read' in n or 'mem_' in n)
                 print(f"  {'Memory params':20s} {'':>10s} {mem_params:>10,d}")

@@ -808,6 +808,27 @@ attention:
 3. **Cross-attention**: transversal candidates scored against temporal store for
    consistency — temporal memory as a prior on the generative path
 
+### Exclusive Gram attention (XSA-inspired) ← testing
+
+Inspired by [Exclusive Self Attention (XSA)](https://arxiv.org/abs/2603.09078)
+which projects out the self-value direction from attention output (two-line change,
+consistent gains up to 2.7B params).
+
+Applied the exclusion idea to *both* pathways:
+1. **XSA on Q·K**: project out self-value direction from attention output, so
+   attention focuses purely on contextual (non-self) information.
+2. **Geometric exclusion on Gram**: project out the self-write Plücker direction
+   from read lines before computing incidence, so the Gram memory only captures
+   relational structure *orthogonal* to the current token's geometry.
+
+Motivation: the residual already carries self-information to the FFN, so both
+attention and Gram memory should focus exclusively on *other* tokens' information.
+
+Implementation: `ExclusiveOnlineMemoryAttention` in `exp_mem_attn.py`
+- Forward pass and gradient flow verified
+- Run: `uv run python exp_mem_attn.py xsa_online_mem`
+- Status: **awaiting PPL results** (needs local run with data/network access)
+
 ## Open questions
 
 - **Geometry only helps with weak embeddings**: Can geometry add to neural embedding
