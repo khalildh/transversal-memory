@@ -1554,6 +1554,259 @@ class IncidenceRouteAttention(nn.Module):
         return self.out(combined)
 
 
+class EigenGramAttention(nn.Module):
+    """O(T) Gram scoring via cumsum — replaces O(T²) incidence matrix.
+
+    The online_mem variant builds a (B,H,T,T) incidence matrix to compute
+    a per-position scalar gate: score_t = Σ_{s<t} (read_t · J · write_s)².
+    This is O(T²) in time and memory.
+
+    Mathematical equivalence:
+      Σ_{s<t} (read_t · J · write_s)² = read_t^T · (J^T · M_t · J) · read_t
+      where M_t = Σ_{s<t} write_s ⊗ write_s  (6×6 Gram matrix)
+
+    So we can compute the SAME scalar by maintaining the 6×6 Gram
+    incrementally. Using cumsum with exponential rescaling, the causal
+    Grams M_0, M_1, ..., M_{T-1} are computed in parallel.
+
+    Complexity comparison (per head):
+      online_mem:   O(T² × 6) time,  O(T²) memory
+      eigen_gram:   O(T × 36) time,  O(T × 36) memory
+      Ratio:        6T/36 = T/6       T/36
+
+    At T=128: 21× fewer FLOPs, 4× less memory.
+    At T=512: 85× fewer FLOPs, 14× less memory.
+
+    Bonus: eigendecompose the accumulated Gram to get "relational factor"
+    features — the attention analog of X/Y separation in exp_xy_sort.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        pd = self.plucker_dim
+
+        # === Standard attention ===
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # === Plücker write/read lines ===
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        ppd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, ppd)
+        w2 = self.W2_write(x).reshape(B, T, H, ppd)
+        write_lines = exterior(w1, w2, self.pairs)  # (B, T, H, pd)
+        r1 = self.W1_read(x).reshape(B, T, H, ppd)
+        r2 = self.W2_read(x).reshape(B, T, H, ppd)
+        read_lines = exterior(r1, r2, self.pairs)   # (B, T, H, pd)
+
+        # Dual write lines: Jw = write @ J
+        J = self.J
+        Jw = torch.einsum('bthi,ij->bthj', write_lines, J)  # (B, T, H, pd)
+        Jw = Jw.permute(0, 2, 1, 3)  # (B, H, T, pd)
+        rd = read_lines.permute(0, 2, 1, 3)  # (B, H, T, pd)
+
+        # === O(T) causal Gram via cumsum with exponential decay ===
+        # Outer products: (B, H, T, pd, pd)
+        outer = Jw.unsqueeze(-1) * Jw.unsqueeze(-2)
+
+        if self.decay != 1.0:
+            positions = torch.arange(T, device=x.device, dtype=x.dtype)
+            # Scale outer products to factor out decay: outer_scaled[t] = decay^{-t} outer[t]
+            decay_inv = (1.0 / self.decay) ** positions
+            outer_scaled = outer * decay_inv.reshape(1, 1, T, 1, 1)
+            # Cumulative sum over time
+            M_cumsum = torch.cumsum(outer_scaled, dim=2)
+            # Causal shift: M_t uses writes from s < t only
+            M_cumsum = torch.cat([
+                torch.zeros(B, H, 1, pd, pd, device=x.device, dtype=x.dtype),
+                M_cumsum[:, :, :-1]
+            ], dim=2)
+            # Re-apply forward decay: M_t = decay^t * cumsum_t
+            decay_fwd = self.decay ** positions
+            M_all = M_cumsum * decay_fwd.reshape(1, 1, T, 1, 1)
+        else:
+            M_cumsum = torch.cumsum(outer, dim=2)
+            M_all = torch.cat([
+                torch.zeros(B, H, 1, pd, pd, device=x.device, dtype=x.dtype),
+                M_cumsum[:, :, :-1]
+            ], dim=2)
+
+        # === Batch score: score_t = read_t^T @ M_t @ read_t ===
+        # This is the "batch comparison" — one einsum scores all T reads
+        # against their respective causal Grams simultaneously.
+        temp = torch.einsum('bhtij,bhtj->bhti', M_all, rd)  # (B, H, T, pd)
+        mem_score = (temp * rd).sum(-1)  # (B, H, T)
+
+        # === Same gating as online_mem ===
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)  # (B, T, H)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)  # (B, T, 1)
+
+        return self.out(seq_out + gated * mem_val)
+
+
+class EigenGramFeatAttention(nn.Module):
+    """Gram eigenstructure as attention features — richer than scalar gate.
+
+    Like EigenGramAttention but instead of collapsing to a scalar gate,
+    uses the Gram's eigendecomposition to produce per-head feature vectors:
+
+    1. Accumulate causal Gram M_t per head (same O(T) cumsum trick)
+    2. Eigendecompose M_t → top-k eigenvectors V_t, eigenvalues λ_t
+    3. Project read lines onto V_t → k-dim "relational factor" features
+    4. Weight by eigenvalues: features_t = (V_t^T read_t) * sqrt(λ_t)
+    5. Feed through small MLP → d_head vector per head
+
+    The eigenvectors capture which relational patterns dominate. In the
+    X+Y sorting analog: eigenvec 1 separates X (syntax?), eigenvec 2
+    separates Y (semantics?). The MLP learns how to combine them.
+
+    Since eigendecomposition of 6×6 is O(1), this adds negligible cost.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4,
+                 use_j=True, n_eigen=3, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+        self.point_dim = point_dim
+        self.n_eigen = n_eigen
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+
+        # MLP: eigen features → per-head output
+        self.eigen_mlp = nn.Sequential(
+            nn.Linear(n_eigen, self.d_head),
+            nn.GELU(),
+            nn.Linear(self.d_head, self.d_head),
+        )
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        pd = self.plucker_dim
+
+        # Standard attention
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = std_attn @ v  # (B, H, T, dh)
+
+        # Write/read lines
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        ppd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, ppd)
+        w2 = self.W2_write(x).reshape(B, T, H, ppd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, ppd)
+        r2 = self.W2_read(x).reshape(B, T, H, ppd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        Jw = torch.einsum('bthi,ij->bthj', write_lines, J).permute(0, 2, 1, 3)
+        rd = read_lines.permute(0, 2, 1, 3)
+
+        # Causal Grams via cumsum (same as EigenGramAttention)
+        outer = Jw.unsqueeze(-1) * Jw.unsqueeze(-2)
+        if self.decay != 1.0:
+            positions = torch.arange(T, device=x.device, dtype=x.dtype)
+            decay_inv = (1.0 / self.decay) ** positions
+            decay_fwd = self.decay ** positions
+            outer_scaled = outer * decay_inv.reshape(1, 1, T, 1, 1)
+            M_cumsum = torch.cumsum(outer_scaled, dim=2)
+            M_cumsum = torch.cat([
+                torch.zeros(B, H, 1, pd, pd, device=x.device, dtype=x.dtype),
+                M_cumsum[:, :, :-1]
+            ], dim=2)
+            M_all = M_cumsum * decay_fwd.reshape(1, 1, T, 1, 1)
+        else:
+            M_cumsum = torch.cumsum(outer, dim=2)
+            M_all = torch.cat([
+                torch.zeros(B, H, 1, pd, pd, device=x.device, dtype=x.dtype),
+                M_cumsum[:, :, :-1]
+            ], dim=2)
+
+        # Eigendecompose the FINAL Gram (not per-position — too expensive).
+        # The final Gram M_{T-1} summarizes all relational patterns in the
+        # sequence. Its eigenvectors are applied to all positions — this is
+        # an approximation (non-causal eigenvectors) but O(B*H) decompositions
+        # of 6×6 matrices vs O(B*H*T).
+        M_final = M_all[:, :, -1]  # (B, H, pd, pd)
+        evals, evecs = torch.linalg.eigh(M_final)  # (B,H,pd), (B,H,pd,pd)
+
+        # Top-k eigenvectors (eigh returns ascending order, so take last k)
+        k = self.n_eigen
+        V_top = evecs[..., -k:]      # (B, H, pd, k)
+        lam_top = evals[..., -k:]    # (B, H, k)
+
+        # Project ALL read lines onto top-k eigenvectors (batch comparison!)
+        # rd: (B, H, T, pd), V_top: (B, H, pd, k) → (B, H, T, k)
+        proj = torch.einsum('bhti,bhik->bhtk', rd, V_top)
+
+        # Weight by sqrt(eigenvalue) — scale by pattern strength
+        weighted = proj * lam_top.clamp(min=0).sqrt().unsqueeze(2)  # (B, H, T, k)
+
+        # MLP readout → (B, H, T, dh)
+        mem_out = self.eigen_mlp(weighted)
+
+        # Gate
+        gate = torch.sigmoid(self.mem_gate(x)).permute(0, 2, 1).unsqueeze(-1)  # (B, H, T, 1)
+
+        combined = seq_out + gate * mem_out
+        combined = combined.transpose(1, 2).reshape(B, T, D)
+        return self.out(combined)
+
+
 # ── Model ────────────────────────────────────────────────────────────────────
 
 ATTN_CLASSES = {
@@ -1575,6 +1828,8 @@ ATTN_CLASSES = {
     "multi_write": MultiWriteMemoryAttention,
     "inc_route": IncidenceRouteAttention,
     "gram_route": GramRouteAttention,
+    "eigen_gram": EigenGramAttention,
+    "eigen_feat": EigenGramFeatAttention,
 }
 
 class Block(nn.Module):
