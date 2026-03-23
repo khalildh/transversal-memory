@@ -479,6 +479,98 @@ for queries, then the real forward with recalled values). This doubles
 compute when reading is active. Could optimize by caching write lines
 from the previous batch instead.
 
+#### 3k. Iterated Gram (M² 2-hop matching) ← TESTED, negligible
+
+**Status: tested March 23, 2026 — no benefit over standard Gram**
+
+Instead of rd·M·rd (standard), interpolate with rd·M²·rd (2-hop matching).
+M² captures degree-6 interactions: two writes that share structure with a
+common third write both contribute. Learned interpolation parameter α
+between M and M² via sigmoid.
+
+Implementation: `exp_fast.py` IteratedGramAttention, `exp_new_ideas.py`.
+
+Results (2-layer, d=128, 4 heads, synthetic bigram data, 10 epochs):
+
+| Model | PPL | Δ vs standard |
+|-------|-----|---------------|
+| Standard | 190.6 | ←baseline |
+| Online mem | 190.3 | -0.2% |
+| **Iterated Gram** | **190.6** | **-0.0%** |
+
+**Finding**: M² adds no value. The 2-hop relational matching doesn't capture
+structure that M alone misses. The learned α likely stays near 0 (pure M).
+This is consistent with the finding that the information bottleneck is the
+model's ability to USE geometric signal, not the Gram's ability to encode it.
+
+#### 3l. Learned Gram transition (SSM-style) ← TESTED, marginal
+
+**Status: tested March 23, 2026 — ties online_mem, 2x slower**
+
+Replace scalar decay M_t = λ·M_{t-1} + w⊗w with learned 6×6 transition
+matrix: M_t = A·M_{t-1}·A^T + w_t⊗w_t. Allows the Gram to rotate/mix
+its relational structure at each step (like a linear SSM on the Gram).
+Initialized as 0.99·I (near scalar decay).
+
+Implementation: `exp_fast.py` LearnedTransitionAttention, `exp_new_ideas.py`.
+
+Results (2-layer, d=128, 4 heads, synthetic bigram data, 10 epochs):
+
+| Model | PPL | Δ vs standard | Time/epoch |
+|-------|-----|---------------|------------|
+| Standard | 190.6 | ←baseline | ~14s |
+| Online mem | 190.3 | -0.2% | ~18s |
+| **Learned transition** | **190.2** | **-0.2%** | **~36s** |
+
+**Finding**: Ties online_mem but is 2x slower due to the sequential scan
+(can't be parallelized via cumsum like scalar decay). The 6×6 transition
+matrix has 36 parameters per head (vs 1 scalar decay), but doesn't learn
+anything more useful. A likely explanation: on this data, scalar decay
+already captures the temporal weighting well — there's no rotational
+structure in the bigram-generated Gram that A can exploit.
+
+**Lesson**: Sequential scans are expensive. Only worth it if they provide
+qualitatively different behavior (like Mamba's input-dependent transitions).
+
+#### 3m. Separate read/write Grams ← TESTED, marginal
+
+**Status: tested March 23, 2026 — ties online_mem**
+
+Maintains two Gram matrices:
+- M_write = Σ Jw⊗Jw (write structure, queried by read lines)
+- M_read  = Σ Jr⊗Jr (read structure, queried by write lines)
+
+Score = (1-α)·rd·M_write·rd + α·Jw·M_read·Jw, where α is learned.
+The second term is "backward association" — what past reads match my write?
+
+Implementation: `exp_fast.py` SeparateRWGramAttention, `exp_new_ideas.py`.
+
+Results (2-layer, d=128, 4 heads, synthetic bigram data, 10 epochs):
+
+| Model | PPL | Δ vs standard |
+|-------|-----|---------------|
+| Standard | 190.6 | ←baseline |
+| Online mem | 190.3 | -0.2% |
+| **Separate R/W** | **190.3** | **-0.2%** |
+
+**Finding**: Ties online_mem. The read Gram (backward association) doesn't
+add value — likely because in a causal LM, past reads have no privileged
+information about the future. The model probably learns α≈0 (all weight
+on write Gram = standard behavior).
+
+#### Summary of 3k-3m
+
+All three new Gram variants (iterated, learned transition, separate R/W)
+fail to improve over the simple online_mem baseline. This strengthens the
+key finding from the project: **the bottleneck is not in the Gram's
+expressiveness but in the model's ability to use the geometric signal.**
+Richer Gram representations (M², SSM transitions, dual Grams) don't help
+because the scalar gating mechanism can't extract more from them.
+
+Note: tested on synthetic bigram data due to network restrictions. Should
+be re-verified on WikiText-2 where the baseline gap is larger. However,
+the relative rankings should be stable.
+
 ### 4. Higher Grassmannian attention ← TESTED, marginal
 
 **Status: tested March 15, 2026 — higher dims barely help**
