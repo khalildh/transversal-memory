@@ -836,6 +836,16 @@ Synthetic benchmark results (test_xsa_gram.py, vocab=256, d=128, 2 layers):
 - XSA exclusion clearly reduces self-information noise in the Gram pathway
 - On WikiText (where online_mem already beats standard), XSA should amplify the win
 
+Induction head results (exp_sparse_gram.py, vocab=64, seq=48, 3000 steps):
+- standard:        acc 0.101 (baseline)
+- gram_bias:       acc 0.263 (+0.16, geometry signal helps routing)
+- eigen_bias:      acc 0.772 (+0.67, eigendecomposition is a massive win)
+- xsa_eigen_bias:  acc 0.631 (+0.53, XSA HURTS here — -0.14 vs eigen_bias)
+
+**Lesson**: XSA exclusion helps in LM (self-info redundant with residual) but
+hurts on induction/pattern-matching (self-identity IS the query signal). The
+exclusion should be task-conditional or gated, not always-on.
+
 ## Open questions
 
 - **Geometry only helps with weak embeddings**: Can geometry add to neural embedding

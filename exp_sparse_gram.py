@@ -229,16 +229,11 @@ class EigenBiasAttention(nn.Module):
         self.out = nn.Linear(d_model, d_model)
         self.register_buffer('J6', _J6)
 
-    def forward(self, x):
+    def _compute_lines_and_eigen(self, x):
+        """Shared computation: Plücker lines + Gram eigendecomposition."""
         B, T, D = x.shape
-        H, dh = self.n_heads, self.d_head
+        H = self.n_heads
 
-        # Standard Q·K
-        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        std_logits = (q @ k.transpose(-1, -2)) * self.scale
-
-        # Plücker lines
         x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
         w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
         w2 = self.W2_write(x).reshape(B, T, H, 4)
@@ -261,8 +256,20 @@ class EigenBiasAttention(nn.Module):
         V = evecs[..., -k:]      # (B, H, 6, k)
         lam = evals[..., -k:]    # (B, H, k)
 
+        return Jw, rd, V, lam
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        # Standard Q·K
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_logits = (q @ k.transpose(-1, -2)) * self.scale
+
+        Jw, rd, V, lam = self._compute_lines_and_eigen(x)
+
         # Project read and write lines onto eigenbasis
-        # This is the "batch comparison": all T positions projected at once
         r_proj = rd @ V           # (B, H, T, k)
         w_proj = Jw @ V           # (B, H, T, k)
 
@@ -286,12 +293,65 @@ class EigenBiasAttention(nn.Module):
         return self.out(out)
 
 
+class XSAEigenBiasAttention(EigenBiasAttention):
+    """Eigen bias + XSA exclusion: project out self-write direction from read lines.
+
+    Before computing the eigen-projected incidence, each read line has its
+    component along the corresponding write line removed. This forces the
+    geometric bias to capture ONLY cross-token relational structure — the
+    self-information is already in the residual stream for the FFN.
+
+    Same param count as eigen_bias. Only the read projection changes.
+    """
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        # Standard Q·K
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_logits = (q @ k.transpose(-1, -2)) * self.scale
+
+        Jw, rd, V, lam = self._compute_lines_and_eigen(x)
+
+        # ── XSA exclusion: project out self-write direction from read lines ──
+        # For each position t, remove the component of rd[t] along Jw[t]
+        # rd_excl[t] = rd[t] - (rd[t]·Jw[t] / ||Jw[t]||²) Jw[t]
+        dot = (rd * Jw).sum(dim=-1, keepdim=True)       # (B, H, T, 1)
+        norm_sq = (Jw * Jw).sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        rd_excl = rd - (dot / norm_sq) * Jw              # (B, H, T, 6)
+
+        # Project excluded read lines and write lines onto eigenbasis
+        r_proj = rd_excl @ V      # (B, H, T, k)
+        w_proj = Jw @ V           # (B, H, T, k)
+
+        # Weight by sqrt(eigenvalue)
+        lam_sqrt = lam.clamp(min=0).sqrt().unsqueeze(2)
+        r_proj = r_proj * lam_sqrt
+        w_proj = w_proj * lam_sqrt
+
+        # Low-rank approximation of incidence
+        approx_inc = r_proj @ w_proj.transpose(-1, -2)
+
+        scale = self.bias_scale.reshape(1, H, 1, 1)
+        bias = approx_inc.abs() * scale
+
+        logits = std_logits + bias
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        logits = logits.masked_fill(mask, float('-inf'))
+        attn = F.softmax(logits, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        return self.out(out)
+
+
 # ── Transformer ──────────────────────────────────────────────────────────────
 
 ATTN_MAP = {
     "standard": StandardAttention,
     "gram_bias": GramBiasAttention,
     "eigen_bias": EigenBiasAttention,
+    "xsa_eigen_bias": XSAEigenBiasAttention,
 }
 
 class Block(nn.Module):
@@ -398,7 +458,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
-    variants = sys.argv[1:] if len(sys.argv) > 1 else ["standard", "gram_bias", "eigen_bias"]
+    variants = sys.argv[1:] if len(sys.argv) > 1 else ["standard", "gram_bias", "eigen_bias", "xsa_eigen_bias"]
     results = {}
 
     for v in variants:
