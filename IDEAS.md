@@ -837,10 +837,18 @@ Synthetic benchmark results (test_xsa_gram.py, vocab=256, d=128, 2 layers):
 - On WikiText (where online_mem already beats standard), XSA should amplify the win
 
 Induction head results (exp_sparse_gram.py, vocab=64, seq=48, 3000 steps):
+
+Non-causal (BUGGY — future leak in eigendecomposition):
+- eigen_bias:      acc 0.772, xsa_eigen_bias: acc 0.631
+
+Causal fix (cumulative Gram via cumsum, direct rd·M_t·Jw — no eigendecomp needed):
 - standard:        acc 0.101 (baseline)
-- gram_bias:       acc 0.263 (+0.16, geometry signal helps routing)
-- eigen_bias:      acc 0.772 (+0.67, eigendecomposition is a massive win)
-- xsa_eigen_bias:  acc 0.631 (+0.53, XSA HURTS here — -0.14 vs eigen_bias)
+- gram_bias:       acc 0.263 (+0.16, full incidence as bias, already causal)
+- eigen_bias:      acc 0.793 (+0.69, causal Gram-mediated incidence)
+- xsa_eigen_bias:  acc 0.609 (+0.51, XSA hurts — -0.18 vs eigen_bias)
+
+Causal version is actually BETTER than non-causal (0.793 vs 0.772) — future
+tokens were adding noise. Direct rd·M_t·Jw is simpler, stabler, and correct.
 
 **Lesson**: XSA exclusion helps in LM (self-info redundant with residual) but
 hurts on induction/pattern-matching (self-identity IS the query signal). The
