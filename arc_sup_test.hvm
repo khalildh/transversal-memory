@@ -1,0 +1,8 @@
+// Use labeled SUP/DUP to avoid collision
+// SUP label 0 for the superposed value, DUP label 1 for the duplication
+
+// sqd({3 5}, 1) should give {4 16}
+@main = r
+  & {0 3 5} ~ $([-] $(1 d))
+  & d ~ {1 d1 d2}
+  & d1 ~ $([*] $(d2 r))
