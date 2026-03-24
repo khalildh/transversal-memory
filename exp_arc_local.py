@@ -39,7 +39,7 @@ NEXT_LINE = 11
 IO_SEP = 12
 END = 13
 
-N_DEMOS = 2         # number of demonstration pairs per sequence
+N_DEMOS = 1         # number of demonstration pairs per sequence
 # Sequence: N_DEMOS * (<start> + grid + <io_sep> + grid + <end>) + 1 test pair
 # Per pair: 1 + 5*(5+1) + 1 + 5*(5+1) + 1 = 63
 TOKENS_PER_PAIR = 1 + GRID_SIZE * (GRID_SIZE + 1) + 1 + GRID_SIZE * (GRID_SIZE + 1) + 1
@@ -47,7 +47,7 @@ SEQ_LEN = (N_DEMOS + 1) * TOKENS_PER_PAIR  # 3 pairs * 63 = 189
 
 D_MODEL = 96
 N_HEADS = 4
-N_LAYERS = 3
+N_LAYERS = 1
 BATCH = 64
 N_STEPS = 5000
 LR = 3e-4
@@ -436,7 +436,7 @@ def train_variant(attn_type, device):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
     random.seed(42)
 

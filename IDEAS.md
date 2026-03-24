@@ -995,6 +995,87 @@ exclusion should be task-conditional or gated, not always-on.
 - **V-Net projections**: Can equivariant vector neuron layers learn better
   projections into Plücker space than linear W₁, W₂?
 
+## ARC-AGI experiments (exp_arc_real.py)
+
+**Setup**: Train on ARC training tasks, evaluate on ARC evaluation set (unseen
+tasks) via autoregressive generation (no teacher forcing). Implements key
+mdlARC ideas: 3D positional encoding (x=col, y=row, z=section), per-task
+embeddings, 8x dihedral augmentation.
+
+**Results** (98 train tasks, 15 eval pairs, autoregressive generation):
+
+| Variant | Layers | Tok Acc | Grid Acc | Params |
+|---------|--------|---------|----------|--------|
+| Standard | 1 | 24.2% | 0% | 131K |
+| Eigen bias | 1 | 24.2% | 0% | 137K |
+| Standard | 4 | 14.7% | 0% | 818K |
+| **Eigen bias** | **4** | **26.8%** | **0%** | **851K** |
+
+Key findings:
+- 3D positional encoding closed the gap at 1 layer (both 24.2%) — without it,
+  eigen_bias was 23.2% vs standard 4.7%. Spatial awareness matters more than
+  geometric attention for grid tasks.
+- At 4 layers, standard **degrades** (14.7% < 24.2%) — overfitting to 98 tasks.
+  Eigen bias improves (26.8%) — Gram bias acts as regularization.
+- 0% grid accuracy across the board — no complete ARC solutions with this setup.
+
+**Round 2: mdlARC-matched training** (d=64, 4 layers, 274K params):
+
+Closed all training gaps except data and model size:
+- 3D RoPE, RMSNorm, SiLU gated FFN, AdamW (0.9, 0.95), warmup+WSD
+- Color permutation augmentation + 8x dihedral
+- Packed batches (pad to batch max, not global max)
+- **Scheduled sampling** (0%→50% model predictions during training)
+  Prevents memorization — loss stays at 0.3-0.7 instead of dropping to 0
+
+| Variant | Tok Acc | Grid Acc | Notes |
+|---------|---------|----------|-------|
+| Standard (scheduled sampling) | 184/641 (28.7%) peak | 0/15 | Stable, best standard result |
+| Eigen bias (whole-seq Gram) | collapsed to 2.7% | 0/15 | Gram amplifies SS noise |
+| **Eigen bias (per-pair Gram)** | **153/469 (32.6%)** | **0/10** | **Best overall, stable** |
+
+Key findings:
+- **Scheduled sampling is critical** — without it, models memorize 98 tasks
+  instantly (loss→0 by step 200) and eval accuracy stays random. With SS,
+  loss stays high and the model learns transferable in-context reasoning.
+- **Per-pair Gram reset** fixes noise amplification. Resetting the Gram at
+  each `<start>` token prevents garbage write lines from one demo/test pair
+  contaminating the Gram for subsequent pairs. The whole-sequence Gram
+  collapsed from 26.4% to 2.7% under scheduled sampling; per-pair held at 32.6%.
+- **3D positional encoding closed the 1-layer gap** — without it, eigen_bias
+  was 23.2% vs standard 4.7%. With it, both reach 24.2%. Spatial awareness
+  matters more than geometric attention for grid tasks at 1 layer.
+- **At 4 layers, standard degrades but geometry helps** — standard 14.7% vs
+  eigen_bias 26.8% (without SS). The Gram acts as regularization.
+- **Teacher forcing creates train/eval mismatch** — the model trains on
+  correct previous tokens but generates from its own predictions at eval.
+  Scheduled sampling bridges this gap.
+
+**Remaining gaps vs mdlARC** (44% on ARC-1 eval):
+- Data: 98 tasks vs thousands (ARC-1 + ARC-2 + ConceptARC) — dominant factor
+- Params: 274K vs 75M
+
+### Spatial Plücker geometry for ARC grids (exploration)
+
+Encode adjacent grid cells as Plücker lines in P³:
+- Each cell → point (1, x, y, color)
+- Adjacent cells → Plücker line via exterior product
+- Horizontal + vertical adjacencies → full set of spatial lines
+- 6×6 Gram M = L^T @ L captures spatial structure in 36 numbers
+
+Preliminary findings (task 007bbfb7, tiling rule, 3×3 → 9×9):
+- Input Gram is low-rank: top-3 eigenvalues capture 99.1% of variance
+- **Eigenvector alignment between input and output Grams is strong** (cos 0.7-0.97)
+  — the transform preserves geometric principal axes
+- 48% of input-output line pairs are nearly incident (|inner product| < 0.01)
+  — consistent with tiling (output contains copies of input pattern)
+- Eigenvector alignment is consistent across all 5 training pairs
+
+This suggests the rule can be characterized as a **Gram transport** — a
+linear map W such that M_out ≈ W · M_in · W^T. Learning W from demo pairs
+and applying to test input could predict output geometric structure without
+any neural network. Next: test this pure geometry approach.
+
 ## Resolved: X+Y sorting via Plücker geometry (exp_xy_sort.py)
 
 **Question**: Can Plücker geometry provide a sub-O(n² log n) algorithm for
