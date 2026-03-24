@@ -80,11 +80,60 @@ def emb_all(r, c, in_c, out_c, inp, out, H, W):
 # Note: hist_color and 'all' use a placeholder for the output histogram
 # during precomputation (test_input as proxy). This is approximate but
 # still adds useful signal for most tasks.
+def emb_row_features(r, c, in_c, out_c, inp, out, H, W):
+    in_oh = np.zeros(N_COLORS, dtype=np.float32); in_oh[in_c] = 1.0
+    out_oh = np.zeros(N_COLORS, dtype=np.float32); out_oh[out_c] = 1.0
+    in_rh = np.array([np.sum(inp[r]==i) for i in range(N_COLORS)], dtype=np.float32) / W
+    in_ru = np.float32(len(set(inp[r].flatten())) == 1)
+    in_rn = np.float32(len(set(inp[r].flatten())) / max(W, 1))
+    out_rh = np.array([np.sum(out[r]==i) for i in range(N_COLORS)], dtype=np.float32) / W
+    out_ru = np.float32(len(set(out[r].flatten())) == 1)
+    out_rn = np.float32(len(set(out[r].flatten())) / max(W, 1))
+    return np.concatenate([in_oh, out_oh, in_rh, [in_ru, in_rn], out_rh, [out_ru, out_rn]])
+
+
+def emb_col_features(r, c, in_c, out_c, inp, out, H, W):
+    in_oh = np.zeros(N_COLORS, dtype=np.float32); in_oh[in_c] = 1.0
+    out_oh = np.zeros(N_COLORS, dtype=np.float32); out_oh[out_c] = 1.0
+    in_ch = np.array([np.sum(inp[:,c]==i) for i in range(N_COLORS)], dtype=np.float32) / H
+    in_cu = np.float32(len(set(inp[:,c].flatten())) == 1)
+    out_ch = np.array([np.sum(out[:,c]==i) for i in range(N_COLORS)], dtype=np.float32) / H
+    out_cu = np.float32(len(set(out[:,c].flatten())) == 1)
+    return np.concatenate([in_oh, out_oh, in_ch, [in_cu], out_ch, [out_cu]])
+
+
+def emb_color_count(r, c, in_c, out_c, inp, out, H, W):
+    in_oh = np.zeros(N_COLORS, dtype=np.float32); in_oh[in_c] = 1.0
+    out_oh = np.zeros(N_COLORS, dtype=np.float32); out_oh[out_c] = 1.0
+    in_cnt = np.float32(np.sum(inp == in_c) / max(inp.size, 1))
+    out_cnt = np.float32(np.sum(out == out_c) / max(out.size, 1))
+    in_mode = np.float32(in_c == np.argmax(np.bincount(inp.flatten(), minlength=N_COLORS)))
+    out_mode = np.float32(out_c == np.argmax(np.bincount(out.flatten(), minlength=N_COLORS)))
+    return np.concatenate([in_oh, out_oh, [in_cnt, out_cnt, in_mode, out_mode]])
+
+
+def emb_diagonal(r, c, in_c, out_c, inp, out, H, W):
+    in_oh = np.zeros(N_COLORS, dtype=np.float32); in_oh[in_c] = 1.0
+    out_oh = np.zeros(N_COLORS, dtype=np.float32); out_oh[out_c] = 1.0
+    main_diag = np.float32((r - c + max(H,W)) / (2*max(H,W)))
+    anti_diag = np.float32((r + c) / (H + W - 2 + 1e-6))
+    on_main = np.float32(r == c)
+    on_anti = np.float32(r + c == min(H,W) - 1)
+    pos = np.array([r/max(H-1,1), c/max(W-1,1)], dtype=np.float32)
+    return np.concatenate([in_oh, out_oh, pos, [main_diag, anti_diag, on_main, on_anti]])
+
+
+# Original 4 (hist_color and 'all' use placeholder histogram — approximate
+# but critical for some tasks) plus 4 new non-histogram embeddings
 EMBEDDINGS = [
     ('hist_color', emb_hist_color, 30),
     ('color_only', emb_color_only, 20),
     ('pos_color', emb_pos_color, 22),
     ('all', emb_all, 42),
+    ('row_feat', emb_row_features, 44),
+    ('col_feat', emb_col_features, 42),
+    ('color_count', emb_color_count, 24),
+    ('diagonal', emb_diagonal, 26),
 ]
 
 
