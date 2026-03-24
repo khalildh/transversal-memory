@@ -30,20 +30,20 @@ from itertools import combinations
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-MAX_SEQ_LEN = 512   # filter to tasks that fit
+MAX_SEQ_LEN = 256    # smaller tasks only — faster on CPU
 VOCAB = 14           # 10 colors + 4 special tokens
 START = 10
 NEXT_LINE = 11
 IO_SEP = 12
 END = 13
 
-D_MODEL = 128
+D_MODEL = 96
 N_HEADS = 4
-N_LAYERS = 3
-BATCH = 16           # smaller batch — variable-length real data
-N_STEPS = 6000
-LR = 3e-4
-EVAL_EVERY = 500
+N_LAYERS = 2
+BATCH = 8            # small batch for CPU
+N_STEPS = 2000
+LR = 5e-4
+EVAL_EVERY = 200
 ARC_DIR = "data/ARC-AGI/data/training"
 
 
