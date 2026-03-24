@@ -264,24 +264,66 @@ def solve_task(task):
                 best_score = s
                 best_grid = test_grid.copy()
 
-    # Step 5: ICM refinement on the full grid
-    for icm_round in range(10):
+    # Step 5: ICM with transversal scoring on uncertain cells
+    # Lock confident cells, only search uncertain ones
+    # Score each uncertain cell by trying all colors while holding others fixed
+    # Use the FULL scoring function (pairwise + unary)
+    for icm_round in range(20):
         changed = False
-        for r in range(H):
-            for c in range(W):
-                current = best_grid[r, c]
-                for color in used_colors:
-                    if color == current:
+        for r, c in uncertain_cells:
+            current = best_grid[r, c]
+            best_local_color = current
+            best_local_score = best_score
+            for color in used_colors:
+                if color == current:
+                    continue
+                test_grid = best_grid.copy()
+                test_grid[r, c] = color
+                s = score_grid(test_grid, test_inp, adj_pairs, potentials, used_colors, unary)
+                if s < best_local_score:
+                    best_local_score = s
+                    best_local_color = color
+            if best_local_color != current:
+                best_grid[r, c] = best_local_color
+                best_score = best_local_score
+                changed = True
+        # Also try ALL cells (not just uncertain) in later rounds
+        if icm_round >= 5:
+            for r in range(H):
+                for c in range(W):
+                    if (r, c) in set(uncertain_cells):
+                        continue  # already tried
+                    current = best_grid[r, c]
+                    for color in used_colors:
+                        if color == current:
+                            continue
+                        test_grid = best_grid.copy()
+                        test_grid[r, c] = color
+                        s = score_grid(test_grid, test_inp, adj_pairs, potentials, used_colors, unary)
+                        if s < best_score:
+                            best_score = s
+                            best_grid = test_grid.copy()
+                            changed = True
+        if not changed:
+            break
+
+    # Step 6: Final rescore — try flipping pairs of uncertain cells
+    print(f"  Trying pair flips on {len(uncertain_cells)} uncertain cells...")
+    for i in range(min(len(uncertain_cells), 20)):
+        for j in range(i+1, min(len(uncertain_cells), 20)):
+            r1, c1 = uncertain_cells[i]
+            r2, c2 = uncertain_cells[j]
+            for ca in used_colors:
+                for cb in used_colors:
+                    if ca == best_grid[r1, c1] and cb == best_grid[r2, c2]:
                         continue
                     test_grid = best_grid.copy()
-                    test_grid[r, c] = color
+                    test_grid[r1, c1] = ca
+                    test_grid[r2, c2] = cb
                     s = score_grid(test_grid, test_inp, adj_pairs, potentials, used_colors, unary)
                     if s < best_score:
                         best_score = s
                         best_grid = test_grid.copy()
-                        changed = True
-        if not changed:
-            break
 
     match = np.array_equal(best_grid, test_out)
     cell_acc = np.mean(best_grid == test_out)
