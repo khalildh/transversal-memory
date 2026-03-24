@@ -77,6 +77,9 @@ def emb_all(r, c, in_c, out_c, inp, out, H, W):
     return np.concatenate([pos, in_oh, out_oh, ih, oh])
 
 
+# Note: hist_color and 'all' use a placeholder for the output histogram
+# during precomputation (test_input as proxy). This is approximate but
+# still adds useful signal for most tasks.
 EMBEDDINGS = [
     ('hist_color', emb_hist_color, 30),
     ('color_only', emb_color_only, 20),
@@ -238,10 +241,18 @@ class FastArcSolver:
 
         # Rank
         rank = int((scores < correct_score).sum().item()) + 1
-        best_idx = scores.argmin().item()
+        order = scores.argsort()
+        # Skip identity (output == input is never correct in ARC)
+        best_idx = order[0].item()
         best_grid = np.array(
             [self.used_colors[i] for i in indices[best_idx].cpu().numpy().flatten()]
         ).reshape(H, W)
+        if np.array_equal(best_grid, self.test_inp):
+            best_idx = order[1].item()
+            best_grid = np.array(
+                [self.used_colors[i] for i in indices[best_idx].cpu().numpy().flatten()]
+            ).reshape(H, W)
+            rank = max(1, rank - 1)  # correct answer moves up one
 
         elapsed = time.time() - t0
         return {
