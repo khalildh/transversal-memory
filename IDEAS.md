@@ -318,14 +318,48 @@ information through their multiple attention layers.
 
 **Needs full-data verification at seq=256.**
 
-#### 3g. Gram eigenstructure as features
+#### 3g. Gram eigenstructure as features ← TESTED, strong signal
 
 Instead of scoring read lines against the full Gram matrix, extract the
 top-k eigenvectors of M_t and use them as additional "memory keys" that
 the standard attention can attend to. This exposes the principal relational
 axes directly to the attention mechanism.
 
-More complex to implement (differentiable eigendecomposition needed).
+**exp_sparse_gram.py results** (synthetic induction head task, 2-layer, vocab=64):
+
+| Variant | Final Acc | Description |
+|---------|-----------|-------------|
+| Standard | 10.1% | Vanilla Q·K attention |
+| Gram bias (full incidence) | 24.8% | Q·K + additive |incidence²| bias (O(T²)) |
+| **Eigen bias (eigenstructure)** | **81.1%** | Q·K + low-rank eigenprojection bias (O(T·k)) |
+
+The eigen_bias variant hits a phase transition around step 1000 where accuracy
+jumps from 7% to 22%, then climbs steadily to 81%. The eigendecomposition
+provides a dramatically better signal than raw incidence — the low-rank
+approximation acts as a **denoiser**, filtering out irrelevant geometric
+interactions and exposing the dominant relational axes.
+
+Key insight: the full incidence matrix (gram_bias) only reaches 24.8% despite
+having strictly more information than the eigen approximation. The
+eigendecomposition's rank constraint forces the model to attend to the
+**principal structure** rather than being distracted by noise.
+
+Also tested: **Gram MLP readout** (exp_fast.py, GramMLPAttention) — extracts
+upper triangle of Gram (21 features for 6×6), projects through MLP to d_head
+vector per head. 2-layer WikiText PPL 495.1 vs standard 504.2 vs scalar gate
+492.7. The MLP readout beats standard but loses to the simpler scalar gate,
+suggesting the bottleneck is the **read interface structure** (eigen basis vs
+learned MLP), not just the dimensionality of the output.
+
+**WikiText-2 result** (exp_fast.py, EigenBiasAttention, 2-layer from scratch):
+PPL 501.3 — barely beats standard (504.2), loses to scalar gate (492.7).
+The eigen bias does NOT transfer from synthetic to real tokens. On synthetic
+induction data the Gram has clean repeated structure that eigenvectors capture;
+on real text the Gram is noisy and the top-3 eigenvectors don't isolate the
+relational structure that matters for next-token prediction. The global Gram
+eigenvectors solve a different problem (principal axes of the whole sequence)
+than what the LM needs (position-specific routing). The scalar gate remains
+the best geometry approach for real language modeling.
 
 #### 3h. Multi-scale write lines (from Grassmann Flows) ← TESTED, marginal
 
@@ -955,8 +989,30 @@ exclusion should be task-conditional or gated, not always-on.
   in 32D without lossy projection to capture useful higher-order interactions?
 - **Sequence prediction via transversals**: Can geometric constraints predict
   next tokens in BPE-tokenized text?
-- **Geometric induction heads**: Does Gram memory selectively help on induction-
-  type positions (pattern completion), or does it provide a general context
-  signal? (Test: exp_induction_test.py)
+- **Geometric induction heads** ← ANSWERED YES: Gram memory selectively helps
+  on induction positions (7.7% vs 1.8% on non-induction, 4x selectivity).
+  Eigen bias achieves 81.1% induction accuracy vs 10.1% standard (exp_sparse_gram.py).
 - **V-Net projections**: Can equivariant vector neuron layers learn better
   projections into Plücker space than linear W₁, W₂?
+
+## Resolved: X+Y sorting via Plücker geometry (exp_xy_sort.py)
+
+**Question**: Can Plücker geometry provide a sub-O(n² log n) algorithm for
+X+Y sorting?
+
+**Answer**: No asymptotic improvement, but useful structural properties.
+
+Key findings:
+- Gram eigenvectors cleanly separate X and Y factors: EV1 correlates ρ=0.996
+  with x, EV2 correlates ρ=0.992 with y — the geometry recovers the factored
+  structure from the sum encoding
+- Weighted eigenprojection achieves Spearman ρ=0.995 with true sums from only
+  10% training samples — near-perfect approximate sort from 6 numbers per line
+- "Plücker direct" sort achieves Kendall τ=0.95 consistently (n=10 to n=100)
+- Multi-transversal partition reduces cell range to 11.1% of total range
+- Fundamental obstacle: Plücker inner product is a single scalar comparison,
+  still need Ω(n² log n) evaluations
+
+**Practical value**: O(36)-size Gram as compact summary for approximate sort,
+top-k queries, and threshold queries without full sort. The eigenvector
+factorization is a novel way to recover X/Y marginals from the sum structure.

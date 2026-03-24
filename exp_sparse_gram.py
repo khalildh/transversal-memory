@@ -448,7 +448,7 @@ def train_variant(attn_type, device):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
     variants = sys.argv[1:] if len(sys.argv) > 1 else ["standard", "gram_bias", "eigen_bias", "xsa_eigen_bias"]
