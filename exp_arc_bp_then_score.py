@@ -257,10 +257,15 @@ def solve_task(task, max_uncertain=15):
         n_variants = nc ** n_unc
         print(f"  Reduced to {n_unc} uncertain, {n_variants:,} variants")
 
-    # Step 3: Precompute full scorer transversals (once)
-    print(f"  Building full scorer transversals...")
-    # Cache the transversals so we don't recompute per variant
-    cached_trans = []
+    # Step 3: Build precomputed score tables (same as fast solver)
+    color_to_idx = {c: i for i, c in enumerate(used_colors)}
+    print(f"  Building precomputed score tables...")
+    adj_list = [(r,c,r+dr,c+dc) for r in range(H) for c in range(W)
+                for dr,dc in [(0,1),(1,0)] if r+dr<H and c+dc<W]
+
+    # Accumulate score tables across all embeddings
+    score_tables = [np.zeros((nc, nc), dtype=np.float32) for _ in adj_list]
+
     for name, emb_fn, dim in SCORE_EMBEDDINGS:
         rng_proj = np.random.RandomState(hash(name) % 2**31)
         W1 = rng_proj.randn(4, 2*dim).astype(np.float32) * 0.1
@@ -278,47 +283,72 @@ def solve_task(task, max_uncertain=15):
                 L = make_line(ea, eb, W1, W2)
                 if L is not None: lines.append(L)
             trans.extend(compute_trans(lines, 200, np.random.default_rng(42+i)))
-        if trans:
-            cached_trans.append((J6 @ np.stack(trans).T, emb_fn, W1, W2))
+        if not trans: continue
+        JTm = J6 @ np.stack(trans).T
+        for ap_idx, (r, c, r2, c2) in enumerate(adj_list):
+            lt = np.zeros((nc, nc, 6), dtype=np.float32)
+            for ia in range(nc):
+                for ib in range(nc):
+                    ea = emb_fn(r, c, test_inp[r,c], used_colors[ia],
+                                test_inp, test_inp, H, W)
+                    eb = emb_fn(r2, c2, test_inp[r2,c2], used_colors[ib],
+                                test_inp, test_inp, H, W)
+                    L = make_line(ea, eb, W1, W2)
+                    if L is not None: lt[ia, ib] = L
+            flat = lt.reshape(nc*nc, 6) @ JTm
+            score_tables[ap_idx] += np.sum(np.log(np.abs(flat)+1e-10),
+                                            axis=1).reshape(nc,nc).astype(np.float32)
 
-    adj_list = [(r,c,r+dr,c+dc) for r in range(H) for c in range(W)
-                for dr,dc in [(0,1),(1,0)] if r+dr<H and c+dc<W]
+    # Precompute: which adj pairs touch uncertain cells?
+    unc_set = set(uncertain_cells)
+    # Split adj pairs into fixed (both cells locked) and variable (at least one uncertain)
+    fixed_score = 0.0
+    variable_adj = []  # (ap_idx, r, c, r2, c2)
+    bp_idx = np.array([[color_to_idx[bp_grid[r,c]] for c in range(W)] for r in range(H)])
 
-    def score_variant(grid):
-        total = 0.0
-        for JTm, emb_fn, W1, W2 in cached_trans:
-            lines = []
-            for r, c, r2, c2 in adj_list:
-                ea = emb_fn(r, c, test_inp[r,c], grid[r,c], test_inp, grid, H, W)
-                eb = emb_fn(r2, c2, test_inp[r2,c2], grid[r2,c2], test_inp, grid, H, W)
-                L = make_line(ea, eb, W1, W2)
-                if L is not None: lines.append(L)
-            if lines:
-                Lm = np.stack(lines)
-                total += np.sum(np.log(np.abs(Lm @ JTm) + 1e-10))
-        return total
+    for ap_idx, (r, c, r2, c2) in enumerate(adj_list):
+        if (r,c) in unc_set or (r2,c2) in unc_set:
+            variable_adj.append((ap_idx, r, c, r2, c2))
+        else:
+            fixed_score += score_tables[ap_idx][bp_idx[r,c], bp_idx[r2,c2]]
 
-    # Step 4: Enumerate variants on uncertain cells, score each
-    print(f"  Scoring {n_variants:,} variants...")
+    print(f"  Fixed adj pairs: {len(adj_list)-len(variable_adj)}, variable: {len(variable_adj)}")
+
+    # Step 4: Enumerate variants, score only variable adj pairs
+    print(f"  Scoring {n_variants:,} variants (fast table lookup)...")
     best_grid = bp_grid.copy()
-    best_score = score_variant(bp_grid)
+    best_score = float('inf')
     n_scored = 0
 
     for combo in cartesian(range(nc), repeat=n_unc):
-        variant = bp_grid.copy()
+        # Build grid index for this variant
+        grid_idx = bp_idx.copy()
         for k, (r, c) in enumerate(uncertain_cells):
-            variant[r, c] = used_colors[combo[k]]
-        s = score_variant(variant)
+            grid_idx[r, c] = combo[k]
+
+        # Score: fixed + variable
+        s = fixed_score
+        for ap_idx, r, c, r2, c2 in variable_adj:
+            s += score_tables[ap_idx][grid_idx[r,c], grid_idx[r2,c2]]
+
         n_scored += 1
         if s < best_score:
             best_score = s
-            best_grid = variant.copy()
+            best_combo = combo
+
+    # Build best grid
+    best_grid = bp_grid.copy()
+    for k, (r, c) in enumerate(uncertain_cells):
+        best_grid[r, c] = used_colors[best_combo[k]]
 
     match = np.array_equal(best_grid, test_out)
     cell_acc = np.mean(best_grid == test_out)
 
-    # Also check correct answer score
-    correct_score = score_variant(test_out)
+    # Score correct answer
+    correct_idx = np.array([[color_to_idx[test_out[r,c]] for c in range(W)] for r in range(H)])
+    correct_score = fixed_score
+    for ap_idx, r, c, r2, c2 in variable_adj:
+        correct_score += score_tables[ap_idx][correct_idx[r,c], correct_idx[r2,c2]]
 
     return {
         'prediction': best_grid,
