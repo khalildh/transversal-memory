@@ -1,0 +1,12 @@
+ARC Plucker Transversal Solver (C)
+Embeddings: 8, Trans/pair: 200
+Tasks: 1
+
+  b1948b0a (3 train, 4x4):
+  Building 153 histogram tables for 1 hist embeddings...
+    DEBUG: correct=-65953.648438 best=-65953.648438 diff=0.00e+00 better=0
+    SOLVED  rank 1/43046721
+    4800 transversals, setup=0.0s, score=4.89s
+
+============================================================
+SUMMARY: 1/1 solved, 1/1 rank 1

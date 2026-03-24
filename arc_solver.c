@@ -51,7 +51,9 @@
 #define N_EMBEDDINGS    8
 #define MAX_EMB_DIM    44
 #define MAX_TRAIN_PAIRS 10
+#ifndef N_TRANS_PER_PAIR
 #define N_TRANS_PER_PAIR 200
+#endif
 #define MAX_HIST_TABLES 2000
 
 /* Embedding dimensions (must match Python) */

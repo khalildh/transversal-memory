@@ -1,0 +1,12 @@
+ARC Plucker Transversal Solver (C)
+Embeddings: 8, Trans/pair: 200
+Tasks: 1
+
+  b8cdaf2b (4 train, 9x9):
+  7 colors, 100000 histograms -- using placeholder for hist embeddings
+  Too many candidates (1977326743), using sampling (10000000 samples)
+    SOLVED  rank 1/1977326743
+    6400 transversals, setup=0.1s, score=9.59s
+
+============================================================
+SUMMARY: 1/1 solved, 1/1 rank 1
