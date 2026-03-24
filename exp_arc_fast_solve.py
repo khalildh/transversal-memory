@@ -202,7 +202,7 @@ class FastArcSolver:
 
         # Generate all candidates as color index tensors
         # For small grids, enumerate directly
-        if n_total > 500_000_000:
+        if n_total > 200_000_000:
             print(f"  Too many candidates ({n_total:,}), using sampling")
             return self._solve_sampling()
 
