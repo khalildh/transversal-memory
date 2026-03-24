@@ -143,15 +143,25 @@ class FastArcSolver:
         self.n_adj = len(self.adj_pairs)
 
         # Build precomputed score tables for each embedding
-        self.score_tables = []  # list of lists of (nc, nc) tensors on device
+        # Non-histogram embeddings get one table; histogram embeddings get
+        # a table per possible output histogram.
+        self.score_tables = []  # non-histogram: list of (nc, nc) tensors
         self.total_trans = 0
+
+        # Input histogram (fixed)
+        inp_hist = np.array([np.sum(self.test_inp == c)
+                             for c in range(N_COLORS)], dtype=np.float32)
+
+        HIST_NAMES = {'hist_color', 'all'}
+        self.hist_tables = {}  # {hist_tuple: list of (nc, nc) tensors}
+        hist_JTm_data = []     # [(JTm, emb_fn, W1, W2)] for hist embeddings
 
         for name, emb_fn, dim in EMBEDDINGS:
             rng_proj = np.random.RandomState(hash(name) % 2**31)
             W1 = rng_proj.randn(4, 2 * dim).astype(np.float32) * 0.1
             W2 = rng_proj.randn(4, 2 * dim).astype(np.float32) * 0.1
 
-            # Compute transversals from training pairs
+            # Compute transversals from training pairs (always correct)
             trans = []
             for i, pair in enumerate(task['train']):
                 inp, out = np.array(pair['input']), np.array(pair['output'])
@@ -167,35 +177,100 @@ class FastArcSolver:
 
             self.total_trans += len(trans)
             if not trans:
-                self.score_tables.append(None)
+                if name not in HIST_NAMES:
+                    self.score_tables.append(None)
                 continue
 
             JTm = J6 @ np.stack(trans).T  # (6, n_trans)
 
-            # Precompute line tables and score tables
-            tables = []
-            for r, c, r2, c2 in self.adj_pairs:
-                lt = np.zeros((self.nc, self.nc, 6), dtype=np.float32)
-                for ia in range(self.nc):
-                    for ib in range(self.nc):
-                        ea = emb_fn(r, c, self.test_inp[r, c],
-                                    self.used_colors[ia], self.test_inp,
-                                    # Dummy output — histogram will vary per candidate
-                                    # but we precompute per-cell, so use placeholder
-                                    self.test_inp, H, W)
-                        eb = emb_fn(r2, c2, self.test_inp[r2, c2],
-                                    self.used_colors[ib], self.test_inp,
-                                    self.test_inp, H, W)
-                        L = make_line(ea, eb, W1, W2)
-                        if L is not None:
-                            lt[ia, ib] = L
-                # Score table: (nc, nc) = sum_log over transversals
-                flat_inner = lt.reshape(self.nc * self.nc, 6) @ JTm
-                st = np.sum(np.log(np.abs(flat_inner) + 1e-10),
-                            axis=1).reshape(self.nc, self.nc).astype(np.float32)
-                tables.append(torch.tensor(st, dtype=torch.float32, device=device))
+            if name in HIST_NAMES:
+                hist_JTm_data.append((JTm, emb_fn, W1, W2))
+            else:
+                # Non-histogram: single precomputed table
+                tables = []
+                for r, c, r2, c2 in self.adj_pairs:
+                    lt = np.zeros((self.nc, self.nc, 6), dtype=np.float32)
+                    for ia in range(self.nc):
+                        for ib in range(self.nc):
+                            ea = emb_fn(r, c, self.test_inp[r, c],
+                                        self.used_colors[ia], self.test_inp,
+                                        self.test_inp, H, W)
+                            eb = emb_fn(r2, c2, self.test_inp[r2, c2],
+                                        self.used_colors[ib], self.test_inp,
+                                        self.test_inp, H, W)
+                            L = make_line(ea, eb, W1, W2)
+                            if L is not None:
+                                lt[ia, ib] = L
+                    flat_inner = lt.reshape(self.nc * self.nc, 6) @ JTm
+                    st = np.sum(np.log(np.abs(flat_inner) + 1e-10),
+                                axis=1).reshape(self.nc, self.nc).astype(np.float32)
+                    tables.append(torch.tensor(st, dtype=torch.float32, device=device))
+                self.score_tables.append(tables)
 
-            self.score_tables.append(tables)
+        # Precompute per-histogram tables
+        if hist_JTm_data:
+            all_hists = []
+            def _gen(rem, ncols, cur):
+                if ncols == 1:
+                    all_hists.append(tuple(cur + [rem]))
+                    return
+                for k in range(rem + 1):
+                    _gen(rem - k, ncols - 1, cur + [k])
+            _gen(H * W, self.nc, [])
+
+            for hist in all_hists:
+                out_h = np.zeros(N_COLORS, dtype=np.float32)
+                for ci, cnt in enumerate(hist):
+                    out_h[self.used_colors[ci]] = cnt
+                diff = (out_h - inp_hist) / max(self.test_inp.size, 1)
+
+                combined_tables = [np.zeros((self.nc, self.nc), dtype=np.float32)
+                                   for _ in range(self.n_adj)]
+                ih_norm = inp_hist / max(self.test_inp.size, 1)
+                oh_norm = out_h / max(self.test_inp.size, 1)
+
+                for JTm, emb_fn, W1, W2 in hist_JTm_data:
+                    for ap_idx, (r, c, r2, c2) in enumerate(self.adj_pairs):
+                        for ia in range(self.nc):
+                            # Build embedding manually with correct histogram
+                            in_c = int(self.test_inp[r, c])
+                            out_c = int(self.used_colors[ia])
+                            in_oh_a = np.zeros(N_COLORS, dtype=np.float32)
+                            in_oh_a[in_c] = 1.0
+                            out_oh_a = np.zeros(N_COLORS, dtype=np.float32)
+                            out_oh_a[out_c] = 1.0
+                            if emb_fn == emb_hist_color:
+                                ea = np.concatenate([in_oh_a, out_oh_a, diff])
+                            else:  # emb_all
+                                pos_a = np.array([r/max(H-1,1), c/max(W-1,1)],
+                                                 dtype=np.float32)
+                                ea = np.concatenate([pos_a, in_oh_a, out_oh_a,
+                                                     ih_norm, oh_norm])
+
+                            for ib in range(self.nc):
+                                in_c2 = int(self.test_inp[r2, c2])
+                                out_c2 = int(self.used_colors[ib])
+                                in_oh_b = np.zeros(N_COLORS, dtype=np.float32)
+                                in_oh_b[in_c2] = 1.0
+                                out_oh_b = np.zeros(N_COLORS, dtype=np.float32)
+                                out_oh_b[out_c2] = 1.0
+                                if emb_fn == emb_hist_color:
+                                    eb = np.concatenate([in_oh_b, out_oh_b, diff])
+                                else:
+                                    pos_b = np.array([r2/max(H-1,1), c2/max(W-1,1)],
+                                                     dtype=np.float32)
+                                    eb = np.concatenate([pos_b, in_oh_b, out_oh_b,
+                                                         ih_norm, oh_norm])
+
+                                L = make_line(ea, eb, W1, W2)
+                                if L is not None:
+                                    inner = L @ JTm
+                                    combined_tables[ap_idx][ia, ib] += np.sum(
+                                        np.log(np.abs(inner) + 1e-10))
+
+                self.hist_tables[hist] = [
+                    torch.tensor(t, dtype=torch.float32, device=device)
+                    for t in combined_tables]
 
     def solve(self):
         """Exhaustively score all candidates via table lookup."""
@@ -218,13 +293,32 @@ class FastArcSolver:
         ).reshape(-1, H, W)
         n = indices.shape[0]
 
-        # Score all candidates
+        # Score all candidates — non-histogram embeddings (fast table lookup)
         scores = torch.zeros(n, device=self.device, dtype=torch.float32)
         for emb_tables in self.score_tables:
             if emb_tables is None:
                 continue
             for ap_idx, (r, c, r2, c2) in enumerate(self.adj_pairs):
                 scores += emb_tables[ap_idx][indices[:, r, c], indices[:, r2, c2]]
+
+        # Score histogram-dependent embeddings — group by histogram
+        if self.hist_tables:
+            # Compute histogram for each candidate: count occurrences per color
+            flat_idx = indices.reshape(n, H * W)
+            counts = torch.zeros(n, nc, device=self.device, dtype=torch.long)
+            for ci in range(nc):
+                counts[:, ci] = (flat_idx == ci).sum(dim=1)
+
+            # Score each histogram group
+            for hist_key, hist_tbls in self.hist_tables.items():
+                hist_t = torch.tensor(list(hist_key), dtype=torch.long,
+                                      device=self.device)
+                mask = torch.all(counts == hist_t.unsqueeze(0), dim=1)
+                if not mask.any():
+                    continue
+                for ap_idx, (r, c, r2, c2) in enumerate(self.adj_pairs):
+                    scores[mask] += hist_tbls[ap_idx][
+                        indices[mask, r, c], indices[mask, r2, c2]]
 
         # Find correct answer
         correct_idx_grid = torch.tensor(
