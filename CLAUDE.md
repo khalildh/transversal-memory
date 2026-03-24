@@ -84,3 +84,9 @@ uv run python exp_lm_variants.py kernel|bigram|hybrid|all
 - Config class for LM hyperparameters (d_model=192, n_heads=6, n_layers=4, seq_len=128)
 - Tokenizer: tiktoken gpt2 encoding
 - Training: AdamW, lr=3e-4, gradient clipping at 1.0, 10 epochs
+
+## Conventions
+
+- **Never use inline Python scripts** (`python -c "..."`) for experiments.
+  Always write to a file and run the file. Inline scripts don't flush output
+  properly and are harder to debug.
