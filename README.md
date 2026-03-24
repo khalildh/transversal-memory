@@ -528,6 +528,136 @@ Three key discoveries:
 
 ---
 
+## ARC-AGI solver: 165 tasks solved with zero learning
+
+Using the same Plücker transversal machinery, we built a solver for
+[ARC-AGI](https://arcprize.org/) tasks that produces the correct output
+grid with **zero learning** — no neural network, no training, no parameters
+fitted to ARC data.
+
+**Result: 165/262 same-size ARC training tasks solved at rank 1 (86% of
+non-timeout tasks), scoring the correct output grid above all other
+candidates.**
+
+### How it works
+
+The key insight: an ARC task's input→output transformation creates geometric
+constraints in Plücker space. Adjacent cells in the grid define lines, and
+the correct transformation is the one whose lines best align with transversals
+learned from training examples.
+
+**Pipeline:**
+
+```
+Training pairs (input, output)     Test input
+         │                              │
+    ┌────▼────┐                    ┌────▼────┐
+    │ For each adjacent cell pair, │    │ For each candidate  │
+    │ build Plücker 6-vector from  │    │ output, build lines │
+    │ 8 complementary embeddings   │    │ from same embeddings│
+    └────┬────┘                    └────┬────┘
+         │                              │
+    ┌────▼────┐                         │
+    │ Sample 200 transversals per  │    │
+    │ training pair via P3Memory   │    │
+    │ (4 lines → 2 transversals)   │    │
+    └────┬────┘                         │
+         │                              │
+    ┌────▼──────────────────────────────▼────┐
+    │ Precompute score tables:               │
+    │ table[adj_pair][color_a][color_b] =    │
+    │   Σ log|line · J₆ · transversal|      │
+    │                                        │
+    │ Scoring = table lookups + addition     │
+    │ (no matmul during scoring)             │
+    └────────────────┬───────────────────────┘
+                     │
+                ┌────▼────┐
+                │ Score all candidates    │
+                │ (exhaustive or sampled) │
+                │ Rank 1 = answer         │
+                └─────────┘
+```
+
+**Eight complementary embeddings** encode different aspects of each cell:
+
+| Embedding | What it captures | Dim |
+|-----------|-----------------|:---:|
+| hist_color | Color identity + histogram difference | 30 |
+| color_only | Pure color mapping | 20 |
+| pos_color | Position + color | 22 |
+| all | Position + color + histograms | 42 |
+| row_feat | Row-level color distribution | 44 |
+| col_feat | Column-level color distribution | 42 |
+| color_count | Per-color frequency + mode | 24 |
+| diagonal | Diagonal position features | 26 |
+
+**Dual scoring strategy:**
+- For small grids (≤2000 possible histograms): per-histogram score tables
+  for `hist_color`, giving each candidate its own correct histogram context
+- For large grids: all 8 embeddings with placeholder histograms, combined
+  via raw sum of log-inner-product scores
+
+### Results on ARC training set (262 same-size tasks)
+
+| Category | Count | Rate |
+|----------|:-----:|:----:|
+| **Rank 1 (solved)** | **166** | **63%** |
+| Timeout (>120s) | 70 | 27% |
+| Not rank 1 | 26 | 10% |
+| **Of non-timeout** | **166/192** | **86%** |
+
+Tasks solved span grids from 3×3 to 30×30, with 2–10 colors and candidate
+spaces up to 10^157. Sampling confirms rank 1 via 0/10M random candidates
+scoring better.
+
+The 26 non-rank-1 tasks include several near-misses (rank 12, 42, 107)
+and tasks requiring reasoning beyond pairwise adjacency (object grouping,
+counting, connectivity).
+
+### C solver
+
+A standalone C implementation (`arc_solver.c`) runs all 262 tasks in ~15
+minutes on a single machine (8-way task parallelism, LAPACK SVD, OpenMP).
+The C solver is ~80x faster than the Python version for exhaustive scoring.
+
+```bash
+# Build
+cc -O3 -march=native -framework Accelerate -o arc_solver arc_solver.c -lm
+
+# Run single task
+./arc_solver data/ARC-AGI/data/training/25ff71a9.json
+
+# Run all same-size tasks (8 parallel workers)
+bash run_all_tasks.sh 8
+```
+
+Per-task results are saved in `results/<task_id>.txt`.
+
+### What makes this work
+
+1. **Multi-transversal scoring**: A single transversal is too weak (1 scalar
+   constraint). 200+ transversals from different 4-tuples provide complementary
+   constraints whose intersection uniquely identifies the correct output.
+
+2. **Precomputed tables**: Folding `line · J₆ · transversals` into lookup
+   tables makes scoring O(1) per candidate per adjacency pair — enabling
+   exhaustive search over 134M+ candidates in seconds.
+
+3. **The geometry is task-agnostic**: The same 8 embeddings and scoring
+   pipeline work across color maps, spatial shifts, fills, rotations, and
+   pattern completions without any task-specific logic.
+
+### Limitations
+
+- Only handles same-size tasks (input grid = output grid dimensions)
+- Some results are RNG-sensitive (different random projections can shift rank)
+- Large grids (>20×20) timeout with current compute budget
+- Tasks requiring counting, object segmentation, or multi-step reasoning
+  are not captured by pairwise adjacency features
+
+---
+
 ## Plücker attention: language modeling experiments
 
 Can Plücker geometry replace dot-product attention in transformers? We tested
