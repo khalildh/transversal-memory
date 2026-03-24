@@ -283,16 +283,25 @@ def build_hist_tables_vec(adj_pairs, used_colors, test_inp, inp_hist,
 
 # ── Transversals ─────────────────────────────────────────────────────────────
 
+def _fisher_yates_choose(rng, n, k):
+    """Fisher-Yates partial shuffle matching C's rng_choose."""
+    arr = list(range(n))
+    for i in range(k):
+        j = i + int(rng.random_sample() * (n - i))
+        arr[i], arr[j] = arr[j], arr[i]
+    return arr[:k]
+
+
 def compute_transversals(lines, n_trans=200, rng=None):
     if rng is None:
-        rng = np.random.default_rng(42)
+        rng = np.random.RandomState(42)
     if len(lines) < 4:
         return []
     trans = []
     att = 0
     while len(trans) < n_trans and att < n_trans * 10:
         att += 1
-        idx = rng.choice(len(lines), size=4, replace=False)
+        idx = _fisher_yates_choose(rng, len(lines), 4)
         mem = P3Memory()
         mem.store([lines[idx[i]] for i in range(3)])
         for T, res in mem.query_generative(lines[idx[3]]):
@@ -354,7 +363,10 @@ class FastArcSolver:
         hist_JTm_data = []     # [(JTm, emb_fn, W1, W2)] for hist embeddings
 
         for name, emb_fn, dim in EMBEDDINGS:
-            rng_proj = np.random.RandomState(hash(name) % 2**31)
+            # Deterministic hash (Python's hash() is randomized per-process)
+            import hashlib
+            det_seed = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 2**31
+            rng_proj = np.random.RandomState(det_seed)
             W1 = rng_proj.randn(4, 2 * dim).astype(np.float32) * 0.1
             W2 = rng_proj.randn(4, 2 * dim).astype(np.float32) * 0.1
 
@@ -375,7 +387,7 @@ class FastArcSolver:
                     if L is not None:
                         lines.append(L)
                 trans.extend(compute_transversals(
-                    lines, n_trans_per_pair, np.random.default_rng(42 + i)))
+                    lines, n_trans_per_pair, np.random.RandomState(42 + i)))
 
             self.total_trans += len(trans)
             if not trans:
@@ -475,9 +487,14 @@ class FastArcSolver:
                 mask = torch.all(counts == hist_t.unsqueeze(0), dim=1)
                 if not mask.any():
                     continue
+                idxs = mask.nonzero(as_tuple=True)[0]
+                sub_scores = torch.zeros(len(idxs), device=self.device,
+                                         dtype=torch.float32)
+                sub_ind = indices[idxs]
                 for ap_idx, (r, c, r2, c2) in enumerate(self.adj_pairs):
-                    scores[mask] += hist_tbls[ap_idx][
-                        indices[mask, r, c], indices[mask, r2, c2]]
+                    sub_scores += hist_tbls[ap_idx][
+                        sub_ind[:, r, c], sub_ind[:, r2, c2]]
+                scores[idxs] = sub_scores
         else:
             # Raw sum across non-histogram embeddings (all on same scale)
             scores = torch.zeros(n, device=self.device, dtype=torch.float32)

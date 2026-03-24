@@ -784,15 +784,15 @@ static emb_func_t EMB_FUNCS[8] = {
 
 /* Simple hash matching Python's hash(name) % 2**31 — we use djb2 */
 static unsigned int name_hash(const char *name) {
-    /* Must match Python's hash(name) % 2**31 for these specific names */
-    if (strcmp(name, "hist_color") == 0) return 146416007u;
-    if (strcmp(name, "color_only") == 0) return 1798335606u;
-    if (strcmp(name, "pos_color") == 0) return 547408047u;
-    if (strcmp(name, "all") == 0) return 211858046u;
-    if (strcmp(name, "row_feat") == 0) return 978509765u;
-    if (strcmp(name, "col_feat") == 0) return 3030688u;
-    if (strcmp(name, "color_count") == 0) return 431910641u;
-    if (strcmp(name, "diagonal") == 0) return 2083446988u;
+    /* Deterministic SHA256-based seeds matching Python's hashlib.sha256 */
+    if (strcmp(name, "hist_color") == 0) return 1058250775u;
+    if (strcmp(name, "color_only") == 0) return 441137264u;
+    if (strcmp(name, "pos_color") == 0) return 1939902514u;
+    if (strcmp(name, "all") == 0) return 295351849u;
+    if (strcmp(name, "row_feat") == 0) return 542267216u;
+    if (strcmp(name, "col_feat") == 0) return 952079380u;
+    if (strcmp(name, "color_count") == 0) return 1639721810u;
+    if (strcmp(name, "diagonal") == 0) return 291548388u;
     /* Fallback: djb2 */
     unsigned long h = 5381;
     while (*name) { h = ((h << 5) + h) + (unsigned char)*name; name++; }
@@ -845,23 +845,27 @@ static int make_line_d(const float *ea, const float *eb, int dim,
     memcpy(combined, ea, dim * sizeof(float));
     memcpy(combined + dim, eb, dim * sizeof(float));
 
-    double p1[4], p2[4];
+    /* Use float32 accumulation to match Python's numpy float32 matmul */
+    float p1f[4], p2f[4];
     for (int i = 0; i < 4; i++) {
-        double s1 = 0.0, s2 = 0.0;
+        float s1 = 0.0f, s2 = 0.0f;
         for (int j = 0; j < cd; j++) {
             s1 += W1[i * cd + j] * combined[j];
             s2 += W2[i * cd + j] * combined[j];
         }
-        p1[i] = s1;
-        p2[i] = s2;
+        p1f[i] = s1;
+        p2f[i] = s2;
     }
 
+    float Lf[6];
     for (int k = 0; k < 6; k++)
-        out[k] = p1[PL_I[k]] * p2[PL_J[k]] - p1[PL_J[k]] * p2[PL_I[k]];
+        Lf[k] = p1f[PL_I[k]] * p2f[PL_J[k]] - p1f[PL_J[k]] * p2f[PL_I[k]];
 
-    double n = vec_norm(out, 6);
-    if (n < 1e-10) return 0;
-    for (int k = 0; k < 6; k++) out[k] /= n;
+    float nf = 0.0f;
+    for (int k = 0; k < 6; k++) nf += Lf[k] * Lf[k];
+    nf = sqrtf(nf);
+    if (nf < 1e-10f) return 0;
+    for (int k = 0; k < 6; k++) out[k] = (double)(Lf[k] / nf);
     return 1;
 }
 
@@ -1043,31 +1047,40 @@ static int gen_all_histograms(int total, int nc, int *hist_out, int max_hist) {
     }
     free(stack);
 
-    /* Recursive generation (simpler) */
+    /* Recursive generation matching Python's _gen(rem, ncols, cur) */
     count = 0;
     int *cur = (int *)calloc(nc, sizeof(int));
 
-    /* Use a stack-based DFS for composition generation */
-    typedef struct { int pos; int rem; } Frame;
-    Frame *fstack = (Frame *)malloc((total + 1) * nc * sizeof(Frame));
+    /* Simple recursive approach via explicit stack with full state */
+    typedef struct { int pos; int rem; int k; } Frame;
+    int max_frames = (total + 2) * nc;
+    Frame *fstack = (Frame *)malloc(max_frames * sizeof(Frame));
     int sp = 0;
-    fstack[sp++] = (Frame){0, total};
+    fstack[sp++] = (Frame){0, total, 0};
 
     while (sp > 0) {
-        Frame fr = fstack[--sp];
-        if (fr.pos == nc - 1) {
-            cur[fr.pos] = fr.rem;
+        Frame *fr = &fstack[sp - 1];
+        if (fr->pos == nc - 1) {
+            /* Base case: last bin gets the remainder */
+            cur[fr->pos] = fr->rem;
             if (count < max_hist) {
                 memcpy(hist_out + count * nc, cur, nc * sizeof(int));
                 count++;
             }
+            sp--;
             continue;
         }
-        /* Try all values for position fr.pos from fr.rem down to 0 */
-        for (int k = 0; k <= fr.rem; k++) {
-            cur[fr.pos] = k;
-            fstack[sp++] = (Frame){fr.pos + 1, fr.rem - k};
+        if (fr->k > fr->rem) {
+            /* Done with all values for this position */
+            sp--;
+            continue;
         }
+        /* Set current position to k, advance k for next iteration */
+        cur[fr->pos] = fr->k;
+        int next_rem = fr->rem - fr->k;
+        fr->k++;
+        /* Push child frame for next position */
+        fstack[sp++] = (Frame){fr->pos + 1, next_rem, 0};
     }
 
     free(cur);
@@ -1616,6 +1629,9 @@ static SolveResult solve_task(ArcTask *task) {
 
         result.rank = (int)(better + 1);
         if (is_identity) result.rank = (result.rank > 1) ? result.rank - 1 : result.rank;
+        if (result.rank <= 3)
+            printf("    DEBUG: correct=%.6f best=%.6f diff=%.2e better=%lld\n",
+                   correct_score, best_score, (double)(correct_score - best_score), better);
 
         /* Check if prediction matches */
         if (result.rank == 1) {
