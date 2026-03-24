@@ -206,6 +206,85 @@ def gram_transport_score(candidate, predicted_gram_vec):
     return np.linalg.norm(gram_vec(candidate, z=3.0) - predicted_gram_vec)
 
 
+# ── Training pair verification ───────────────────────────────────────────────
+
+def verify_candidate(candidate, test_input, train_pairs, H, W):
+    """Check if a candidate output is consistent with ALL training pairs.
+
+    Tests simple transforms: shifts, rotations, flips, global color maps.
+    Returns list of consistent rule descriptions, or empty list.
+    """
+    candidate = np.array(candidate)
+    test_input = np.array(test_input)
+    results = []
+
+    # Shifts
+    for dr in range(-H + 1, H):
+        for dc in range(-W + 1, W):
+            if dr == 0 and dc == 0:
+                continue
+            pred = np.roll(np.roll(test_input, dr, 0), dc, 1)
+            if not np.array_equal(pred, candidate):
+                continue
+            ok = all(np.array_equal(
+                np.roll(np.roll(np.array(p['input']), dr, 0), dc, 1),
+                np.array(p['output'])) for p in train_pairs)
+            if ok:
+                results.append(f'shift({dr},{dc})')
+
+    # Rotations
+    for k in range(1, 4):
+        if np.array_equal(np.rot90(test_input, k), candidate):
+            ok = all(np.array_equal(
+                np.rot90(np.array(p['input']), k),
+                np.array(p['output'])) for p in train_pairs)
+            if ok:
+                results.append(f'rot{k * 90}')
+
+    # Flips
+    for name, fn in [('flipud', np.flipud), ('fliplr', np.fliplr),
+                     ('transpose', lambda g: g.T)]:
+        if np.array_equal(fn(test_input), candidate):
+            ok = all(np.array_equal(
+                fn(np.array(p['input'])),
+                np.array(p['output'])) for p in train_pairs)
+            if ok:
+                results.append(name)
+
+    # Global color map
+    color_map = {}
+    cm_ok = True
+    for r in range(H):
+        for c in range(W):
+            ic, oc = int(test_input[r, c]), int(candidate[r, c])
+            if ic in color_map:
+                if color_map[ic] != oc:
+                    cm_ok = False
+                    break
+            else:
+                color_map[ic] = oc
+        if not cm_ok:
+            break
+    if cm_ok:
+        train_ok = True
+        for pair in train_pairs:
+            ti2, to2 = np.array(pair['input']), np.array(pair['output'])
+            for r in range(H):
+                for c in range(W):
+                    ic = int(ti2[r, c])
+                    if ic in color_map and color_map[ic] != int(to2[r, c]):
+                        train_ok = False
+                        break
+                if not train_ok:
+                    break
+            if not train_ok:
+                break
+        if train_ok:
+            results.append(f'color_map')
+
+    return results
+
+
 # ── Solver ───────────────────────────────────────────────────────────────────
 
 def solve_task(task, shortlist_k=200, trans_per_pair=15, emb_dim=4):
@@ -302,6 +381,23 @@ def solve_task(task, shortlist_k=200, trans_per_pair=15, emb_dim=4):
 
     in_shortlist = correct_idx in top_k_idx if correct_idx is not None else False
 
+    # === Stage 3: Verify top candidates against training pairs ===
+    verified = []
+    verify_k = min(50, len(rerank_order))
+    for idx in rerank_order[:verify_k]:
+        cand = all_cands[idx]
+        rules = verify_candidate(cand, test_inp, task['train'], H, W)
+        if rules:
+            verified.append((idx, cand, rules))
+
+    # If verification found candidates, use the first verified one
+    if verified:
+        best_idx = verified[0][0]
+        best_grid = verified[0][1]
+        verified_rules = verified[0][2]
+    else:
+        verified_rules = []
+
     return {
         'prediction': best_grid,
         'correct': test_out,
@@ -313,6 +409,8 @@ def solve_task(task, shortlist_k=200, trans_per_pair=15, emb_dim=4):
         'n_candidates': n_candidates,
         'shortlist_k': shortlist_k,
         'n_transversals': len(rule_trans),
+        'verified': len(verified),
+        'verified_rules': verified_rules,
     }
 
 
@@ -359,7 +457,7 @@ def main():
         task_names = [args.task]
 
     print(f"Sequential Plücker solver (K={args.K})")
-    print(f"Pipeline: transversal top-{args.K} → Gram rerank")
+    print(f"Pipeline: transversal top-{args.K} → Gram rerank → verify top-50 against training")
     print(f"Tasks: {len(task_names)}")
     print()
 
@@ -371,14 +469,19 @@ def main():
         r = solve_task(task, shortlist_k=args.K)
         results.append((tname, r))
 
-        status = "SOLVED" if r['match'] else f"rank {r['final_rank']}"
+        if r['match']:
+            status = "SOLVED"
+            if r['verified_rules']:
+                status += f" via {r['verified_rules']}"
+        else:
+            status = f"rank {r['final_rank']}"
         in_sl = "in shortlist" if r['in_shortlist'] else f"NOT in top-{args.K}"
         print(f"  {tname}: {status} ({in_sl})")
         print(f"    trans={r['trans_rank']}/{r['n_candidates']}, "
               f"gram={r['gram_rank']}/{r['n_candidates']}, "
               f"final={r['final_rank']}/{r['shortlist_k'] if r['in_shortlist'] else r['n_candidates']}")
+        print(f"    verified={r['verified']}/50 candidates consistent with training")
         if not r['match']:
-            H = r['prediction'].shape[0]
             print(f"    predicted: {r['prediction'].flatten().tolist()}")
             print(f"    actual:    {r['correct'].flatten().tolist()}")
         print()
