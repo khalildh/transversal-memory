@@ -160,9 +160,10 @@ def solve_task(task, device):
     test_inp = np.array(task['test'][0]['input'])
     test_out = np.array(task['test'][0]['output'])
     used_colors = sorted(set(
-        c for p in task['train'] + task['test']
+        c for p in task['train']
         for g in [p['input'], p['output']]
-        for row in g for c in row))
+        for row in g for c in row
+    ) | set(c for row in task['test'][0]['input'] for c in row))
     nc = len(used_colors)
     n_total = nc ** (H * W)
     color_to_idx = {c: i for i, c in enumerate(used_colors)}
@@ -177,59 +178,78 @@ def solve_task(task, device):
         print(f"  No transversals found")
         return None
 
-    # Generate all candidate indices
+    # Score in chunks to avoid OOM
     t0 = time.time()
     hw = H * W
-    indices = torch.zeros(n_total, hw, dtype=torch.long, device=device)
-    for pos in range(hw):
-        repeat_each = nc ** (hw - 1 - pos)
-        tile_count = nc ** pos
-        col = torch.arange(nc, device=device).repeat_interleave(repeat_each)
-        indices[:, pos] = col.repeat(tile_count)
-    indices = indices.reshape(-1, H, W)
-    n = indices.shape[0]
+    chunk_size = min(n_total, 5_000_000)
 
-    # Compute histogram for each candidate
-    flat_idx = indices.reshape(n, hw)
-    counts = torch.zeros(n, nc, device=device, dtype=torch.long)
-    for ci in range(nc):
-        counts[:, ci] = (flat_idx == ci).sum(dim=1)
-
-    # Score each candidate using its histogram's table
-    scores = torch.zeros(n, device=device, dtype=torch.float32)
-
-    for hist_key, tables_np in hist_tables.items():
-        hist_t = torch.tensor(list(hist_key), dtype=torch.long, device=device)
-        mask = torch.all(counts == hist_t.unsqueeze(0), dim=1)
-        if not mask.any():
-            continue
-
-        # Move tables to device
-        tables = [torch.tensor(tables_np[ap], dtype=torch.float32, device=device)
-                  for ap in range(len(adj_pairs))]
-
+    # Score correct answer first
+    correct_grid_idx = np.array([color_to_idx[test_out[r,c]] for r in range(H) for c in range(W)])
+    correct_hist = tuple(int(np.sum(correct_grid_idx == ci)) for ci in range(nc))
+    correct_tables = hist_tables.get(correct_hist)
+    correct_score = 0.0
+    if correct_tables is not None:
         for ap_idx, (r, c, r2, c2) in enumerate(adj_pairs):
-            scores[mask] += tables[ap_idx][indices[mask, r, c], indices[mask, r2, c2]]
+            correct_score += float(correct_tables[ap_idx][correct_grid_idx[r*W+c], correct_grid_idx[r2*W+c2]])
 
-    # Find correct answer rank
-    correct_flat = [color_to_idx[test_out[r,c]] for r in range(H) for c in range(W)]
-    correct_idx = None
-    for i in range(n):
-        if indices[i].reshape(-1).cpu().tolist() == correct_flat:
-            correct_idx = i; break
+    better_count = 0
+    best_score = float('inf')
+    best_grid = test_out.copy()
 
-    cs = scores[correct_idx].item()
-    rank = int((scores < cs).sum().item()) + 1
+    n_chunks = (n_total + chunk_size - 1) // chunk_size
+    for chunk_i in range(n_chunks):
+        start = chunk_i * chunk_size
+        end = min(start + chunk_size, n_total)
+        n_chunk = end - start
 
-    # Best prediction
-    best_idx = scores.argmin().item()
-    best_grid = np.array([used_colors[indices[best_idx, r, c].item()]
-                          for r in range(H) for c in range(W)]).reshape(H, W)
+        # Generate indices for this chunk (vectorized)
+        global_idx = torch.arange(start, end, device=device, dtype=torch.long)
+        indices = torch.zeros(n_chunk, hw, dtype=torch.long, device=device)
+        for pos in range(hw):
+            divisor = nc ** (hw - 1 - pos)
+            indices[:, pos] = (global_idx // divisor) % nc
+
+        indices_hw = indices.reshape(n_chunk, H, W)
+
+        # Compute histogram for each candidate
+        flat_idx = indices  # already (n_chunk, hw)
+        counts = torch.zeros(n_chunk, nc, device=device, dtype=torch.long)
+        for ci in range(nc):
+            counts[:, ci] = (flat_idx == ci).sum(dim=1)
+
+        # Score: for each candidate, look up its histogram's tables
+        scores = torch.zeros(n_chunk, device=device, dtype=torch.float32)
+        counts_cpu = counts.cpu().numpy()
+        for hist_key, tables_np in hist_tables.items():
+            hist_arr = np.array(hist_key)
+            mask_np = np.all(counts_cpu == hist_arr, axis=1)
+            if not mask_np.any():
+                continue
+            idxs = np.where(mask_np)[0]
+            idxs_t = torch.tensor(idxs, dtype=torch.long, device=device)
+            sub_hw = indices_hw[idxs_t]
+            sub_scores = torch.zeros(len(idxs), device=device, dtype=torch.float32)
+            for ap_idx, (r, c, r2, c2) in enumerate(adj_pairs):
+                st = torch.tensor(tables_np[ap_idx], dtype=torch.float32, device=device)
+                sub_scores += st[sub_hw[:, r, c], sub_hw[:, r2, c2]]
+            scores[idxs_t] = sub_scores
+
+        # Count how many beat correct
+        better_count += int((scores < correct_score).sum().item())
+
+        # Track best
+        chunk_best_idx = scores.argmin().item()
+        if scores[chunk_best_idx].item() < best_score:
+            best_score = scores[chunk_best_idx].item()
+            best_vals = indices[chunk_best_idx].cpu().numpy()
+            best_grid = np.array([used_colors[v] for v in best_vals]).reshape(H, W)
+
+        if (chunk_i + 1) % 5 == 0 or chunk_i == n_chunks - 1:
+            print(f"    chunk {chunk_i+1}/{n_chunks}: {better_count} better so far ({time.time()-t0:.1f}s)")
+
+    rank = better_count + 1
     # Skip identity
     if np.array_equal(best_grid, test_inp):
-        order = scores.argsort()
-        best_grid = np.array([used_colors[indices[order[1].item(), r, c].item()]
-                              for r in range(H) for c in range(W)]).reshape(H, W)
         rank = max(1, rank - 1)
 
     elapsed = time.time() - t0
