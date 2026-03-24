@@ -1807,6 +1807,316 @@ class EigenGramFeatAttention(nn.Module):
         return self.out(combined)
 
 
+class IteratedGramAttention(nn.Module):
+    """Iterated Gram: read · M² · write instead of read · M · write.
+
+    Standard online memory computes rd · M · Jw = Σ (rd·Jw_s)(Jw_s·Jw_t).
+    Iterated Gram uses M² = M·M, which captures degree-6 interactions:
+    two writes that share structure with a common third write both contribute.
+    This is like 2-hop relational matching through the Gram.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        # Learned interpolation between M and M² (0=pure M, 1=pure M²)
+        self.iter_mix = nn.Parameter(torch.tensor(0.0))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        pd = self.plucker_dim
+
+        # Standard attention
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # Write/read lines
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        ppd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, ppd)
+        w2 = self.W2_write(x).reshape(B, T, H, ppd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, ppd)
+        r2 = self.W2_read(x).reshape(B, T, H, ppd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        Jw = torch.einsum('bthi,ij->bthj', write_lines, J).permute(0, 2, 1, 3)  # (B,H,T,pd)
+        rd = read_lines.permute(0, 2, 1, 3)  # (B,H,T,pd)
+
+        # Build causal Grams via cumsum
+        decays = torch.sigmoid(self.decay_logits)  # (H,)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        outer = Jw.unsqueeze(-1) * Jw.unsqueeze(-2)  # (B,H,T,pd,pd)
+        decay_inv = (1.0 / decays.clamp(min=1e-6)).unsqueeze(1) ** positions.unsqueeze(0)  # (H,T)
+        outer_scaled = outer * decay_inv.reshape(1, H, T, 1, 1)
+        M_cumsum = torch.cumsum(outer_scaled, dim=2)
+        # Shift: M_t uses writes from s < t only
+        M_cumsum = torch.cat([
+            torch.zeros(B, H, 1, pd, pd, device=x.device, dtype=x.dtype),
+            M_cumsum[:, :, :-1]
+        ], dim=2)
+        decay_fwd = decays.unsqueeze(1) ** positions.unsqueeze(0)  # (H,T)
+        M_all = M_cumsum * decay_fwd.reshape(1, H, T, 1, 1)  # (B,H,T,pd,pd)
+
+        # M score: rd · M · Jw^T summed → scalar per position
+        # But we want per-position scalar, so: score_t = rd_t · M_t · rd_t^T
+        rd_M = torch.einsum('bhti,bhtij->bhtj', rd, M_all)  # (B,H,T,pd)
+        score_M = (rd_M * rd).sum(dim=-1)  # (B,H,T)
+
+        # M² score: rd · M² · rd^T = (rd·M) · (M·rd^T) = ||rd·M||²
+        score_M2 = (rd_M * rd_M).sum(dim=-1)  # (B,H,T)
+
+        # Interpolate between M and M²
+        alpha = torch.sigmoid(self.iter_mix)
+        mem_score = (1 - alpha) * score_M + alpha * score_M2
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
+class LearnedTransitionAttention(nn.Module):
+    """Learned state transition: M_t = A · M_{t-1} · A^T + w_t ⊗ w_t.
+
+    Standard Gram accumulates M_t = λ·M_{t-1} + w_t⊗w_t where λ is scalar
+    decay. This replaces scalar decay with a learned 6×6 transition matrix A
+    (per head), allowing the Gram to rotate/mix its relational structure at
+    each step. Like a linear state-space model on the Gram.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+
+        # Per-head transition matrix A, initialized as 0.99 * I (near scalar decay)
+        pd = self.plucker_dim
+        A_init = 0.99 * torch.eye(pd).unsqueeze(0).expand(n_heads, -1, -1).clone()
+        self.A = nn.Parameter(A_init)  # (H, pd, pd)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        pd = self.plucker_dim
+
+        # Standard attention
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # Write/read lines
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        ppd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, ppd)
+        w2 = self.W2_write(x).reshape(B, T, H, ppd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, ppd)
+        r2 = self.W2_read(x).reshape(B, T, H, ppd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        Jw = torch.einsum('bthi,ij->bthj', write_lines, J)  # (B,T,H,pd)
+        Jw = Jw.permute(0, 2, 1, 3)  # (B,H,T,pd)
+        rd = read_lines.permute(0, 2, 1, 3)  # (B,H,T,pd)
+
+        # Sequential Gram scan: M_t = A · M_{t-1} · A^T + Jw_t ⊗ Jw_t
+        # This is O(T) sequential but the 6×6 matmuls are cheap
+        A = self.A  # (H, pd, pd)
+        A_T = A.transpose(-1, -2)  # (H, pd, pd)
+        M = torch.zeros(B, H, pd, pd, device=x.device, dtype=x.dtype)
+        scores = []
+        for t in range(T):
+            # Read before write (causal: M_t uses writes s < t)
+            rd_t = rd[:, :, t, :]  # (B, H, pd)
+            score_t = torch.einsum('bhp,bhpq,bhq->bh', rd_t, M, rd_t)  # (B, H)
+            scores.append(score_t)
+            # Update: M_{t+1} = A · M_t · A^T + Jw_t ⊗ Jw_t
+            Jw_t = Jw[:, :, t, :]  # (B, H, pd)
+            M = torch.einsum('hpq,bhqr,hrs->bhps', A, M, A_T) + \
+                Jw_t.unsqueeze(-1) * Jw_t.unsqueeze(-2)
+
+        mem_score = torch.stack(scores, dim=-1)  # (B, H, T)
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
+class SeparateRWGramAttention(nn.Module):
+    """Separate read/write Gram matrices.
+
+    Standard online memory uses ONE Gram M = Σ Jw⊗Jw and queries it with
+    read lines. This variant maintains TWO Grams:
+    - M_write = Σ Jw⊗Jw (write structure)
+    - M_read  = Σ Jr⊗Jr (read structure)
+    Score = rd · M_write · rd + Jw · M_read · Jw (cross-query)
+    The write Gram answers "what writes are similar to my read?"
+    The read Gram answers "what past reads were similar to my write?"
+    The second term is a form of backward association.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1, decay=0.99, point_dim=4, use_j=True, **kw):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+        self.decay = decay
+        self.point_dim = point_dim
+        self.pairs, self.plucker_dim = make_plucker_pairs(point_dim)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.W1_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_write = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W1_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.W2_read = nn.Linear(d_model, point_dim * n_heads, bias=False)
+        self.mem_value = nn.Linear(d_model, d_model)
+        self.mem_gate = nn.Linear(d_model, n_heads)
+        self.mem_scale = nn.Parameter(torch.full((n_heads,), 0.1))
+        # Learned weight for combining write-Gram and read-Gram scores
+        self.rw_mix = nn.Parameter(torch.tensor(0.0))  # sigmoid → 0.5 init
+        self.out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+        if point_dim == 4 and use_j:
+            self.register_buffer('J', _J6)
+        else:
+            self.register_buffer('J', torch.eye(self.plucker_dim))
+        self.decay_logits = nn.Parameter(torch.full((n_heads,), 4.6))
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        pd = self.plucker_dim
+
+        # Standard attention
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        std_attn = (q @ k.transpose(-1, -2)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        std_attn = std_attn.masked_fill(mask, float('-inf'))
+        std_attn = self.drop(F.softmax(std_attn, dim=-1))
+        seq_out = (std_attn @ v).transpose(1, 2).reshape(B, T, D)
+
+        # Write/read lines
+        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
+        ppd = self.point_dim
+        w1 = self.W1_write(x_prev).reshape(B, T, H, ppd)
+        w2 = self.W2_write(x).reshape(B, T, H, ppd)
+        write_lines = exterior(w1, w2, self.pairs)
+        r1 = self.W1_read(x).reshape(B, T, H, ppd)
+        r2 = self.W2_read(x).reshape(B, T, H, ppd)
+        read_lines = exterior(r1, r2, self.pairs)
+
+        J = self.J
+        Jw = torch.einsum('bthi,ij->bthj', write_lines, J).permute(0, 2, 1, 3)  # (B,H,T,pd)
+        Jr = torch.einsum('bthi,ij->bthj', read_lines, J).permute(0, 2, 1, 3)  # (B,H,T,pd)
+        rd = read_lines.permute(0, 2, 1, 3)  # (B,H,T,pd)
+
+        # Build causal Grams via cumsum with decay
+        decays = torch.sigmoid(self.decay_logits)  # (H,)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+
+        # Write Gram: M_write_t = Σ_{s<t} λ^(t-s) Jw_s ⊗ Jw_s
+        outer_w = Jw.unsqueeze(-1) * Jw.unsqueeze(-2)  # (B,H,T,pd,pd)
+        decay_inv = (1.0 / decays.clamp(min=1e-6)).unsqueeze(1) ** positions.unsqueeze(0)
+        outer_w_scaled = outer_w * decay_inv.reshape(1, H, T, 1, 1)
+        Mw_cumsum = torch.cumsum(outer_w_scaled, dim=2)
+        Mw_cumsum = torch.cat([
+            torch.zeros(B, H, 1, pd, pd, device=x.device, dtype=x.dtype),
+            Mw_cumsum[:, :, :-1]
+        ], dim=2)
+        decay_fwd = decays.unsqueeze(1) ** positions.unsqueeze(0)
+        Mw_all = Mw_cumsum * decay_fwd.reshape(1, H, T, 1, 1)  # (B,H,T,pd,pd)
+
+        # Read Gram: M_read_t = Σ_{s<t} λ^(t-s) Jr_s ⊗ Jr_s
+        outer_r = Jr.unsqueeze(-1) * Jr.unsqueeze(-2)  # (B,H,T,pd,pd)
+        outer_r_scaled = outer_r * decay_inv.reshape(1, H, T, 1, 1)
+        Mr_cumsum = torch.cumsum(outer_r_scaled, dim=2)
+        Mr_cumsum = torch.cat([
+            torch.zeros(B, H, 1, pd, pd, device=x.device, dtype=x.dtype),
+            Mr_cumsum[:, :, :-1]
+        ], dim=2)
+        Mr_all = Mr_cumsum * decay_fwd.reshape(1, H, T, 1, 1)  # (B,H,T,pd,pd)
+
+        # Score from write Gram: rd · M_write · rd^T
+        rd_Mw = torch.einsum('bhti,bhtij->bhtj', rd, Mw_all)
+        score_w = (rd_Mw * rd).sum(dim=-1)  # (B,H,T)
+
+        # Score from read Gram: Jw · M_read · Jw^T (backward association)
+        Jw_Mr = torch.einsum('bhti,bhtij->bhtj', Jw, Mr_all)
+        score_r = (Jw_Mr * Jw).sum(dim=-1)  # (B,H,T)
+
+        # Mix
+        alpha = torch.sigmoid(self.rw_mix)
+        mem_score = (1 - alpha) * score_w + alpha * score_r
+
+        mem_val = self.mem_value(x)
+        gate = torch.sigmoid(self.mem_gate(x))  # (B, T, H)
+        scale = self.mem_scale.reshape(1, H, 1)
+        mem_score_t = mem_score.permute(0, 2, 1)
+        gated = torch.sigmoid(mem_score_t * scale.permute(0, 2, 1)) * gate
+        gated = gated.mean(dim=-1, keepdim=True)
+
+        return self.out(seq_out + gated * mem_val)
+
+
 # ── Model ────────────────────────────────────────────────────────────────────
 
 ATTN_CLASSES = {
@@ -1830,6 +2140,9 @@ ATTN_CLASSES = {
     "gram_route": GramRouteAttention,
     "eigen_gram": EigenGramAttention,
     "eigen_feat": EigenGramFeatAttention,
+    "iterated_gram": IteratedGramAttention,
+    "learned_transition": LearnedTransitionAttention,
+    "separate_rw": SeparateRWGramAttention,
 }
 
 class Block(nn.Module):

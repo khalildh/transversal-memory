@@ -229,16 +229,11 @@ class EigenBiasAttention(nn.Module):
         self.out = nn.Linear(d_model, d_model)
         self.register_buffer('J6', _J6)
 
-    def forward(self, x):
+    def _compute_lines(self, x):
+        """Compute Plücker write/read lines and their Hodge duals."""
         B, T, D = x.shape
-        H, dh = self.n_heads, self.d_head
+        H = self.n_heads
 
-        # Standard Q·K
-        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        std_logits = (q @ k.transpose(-1, -2)) * self.scale
-
-        # Plücker lines
         x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
         w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
         w2 = self.W2_write(x).reshape(B, T, H, 4)
@@ -252,31 +247,88 @@ class EigenBiasAttention(nn.Module):
         Jw = Jwrite.permute(0, 2, 1, 3)  # (B, H, T, 6)
         rd = read_lines.permute(0, 2, 1, 3)  # (B, H, T, 6)
 
-        # Build Gram of write lines: M = Jw.T @ Jw
-        M = Jw.transpose(-1, -2) @ Jw  # (B, H, 6, 6)
+        return Jw, rd
 
-        # Eigendecompose — top-k eigenvectors
-        evals, evecs = torch.linalg.eigh(M)
-        k = self.n_eigen
-        V = evecs[..., -k:]      # (B, H, 6, k)
-        lam = evals[..., -k:]    # (B, H, k)
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
 
-        # Project read and write lines onto eigenbasis
-        # This is the "batch comparison": all T positions projected at once
-        r_proj = rd @ V           # (B, H, T, k)
-        w_proj = Jw @ V           # (B, H, T, k)
+        # Standard Q·K
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, kk, v = qkv[0], qkv[1], qkv[2]
+        std_logits = (q @ kk.transpose(-1, -2)) * self.scale
 
-        # Weight by sqrt(eigenvalue) for scale
-        lam_sqrt = lam.clamp(min=0).sqrt().unsqueeze(2)  # (B, H, 1, k)
-        r_proj = r_proj * lam_sqrt
-        w_proj = w_proj * lam_sqrt
+        Jw, rd = self._compute_lines(x)
 
-        # Low-rank approximation of incidence: (B, H, T, T)
-        approx_inc = r_proj @ w_proj.transpose(-1, -2)
+        # ── Causal Gram-mediated incidence ──
+        # bias[t,s] = rd[t] · M_t · Jw[s]  where M_t = Σ_{r≤t} Jw[r]⊗Jw[r]
+        #
+        # Rewrite: rd[t] · M_t = rd[t] · (Σ_{r≤t} Jw[r]⊗Jw[r])
+        #        = Σ_{r≤t} (rd[t]·Jw[r]) Jw[r]
+        #
+        # This is the same as: (rd @ Jw.T) gives pairwise dots (B,H,T,T),
+        # then cumsum along the key dim and dot with Jw again.
+        #
+        # More efficiently: rd_M[t] = rd[t] @ M_t  via cumulative outer products
+        # M_t: (B, H, T, 6, 6) via cumsum of outer products
+        outer = Jw.unsqueeze(-1) * Jw.unsqueeze(-2)  # (B, H, T, 6, 6)
+        M_causal = outer.cumsum(dim=2)                # (B, H, T, 6, 6)
+
+        # rd_M[t] = rd[t] @ M_t → (B, H, T, 6)
+        rd_M = torch.einsum('bhti,bhtij->bhtj', rd, M_causal)
+
+        # bias[t,s] = rd_M[t] · Jw[s] → (B, H, T, T)
+        bias_raw = torch.einsum('bhti,bhsi->bhts', rd_M, Jw)
 
         # Add as bias
         scale = self.bias_scale.reshape(1, H, 1, 1)
-        bias = approx_inc.abs() * scale
+        bias = bias_raw.abs() * scale
+
+        logits = std_logits + bias
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        logits = logits.masked_fill(mask, float('-inf'))
+        attn = F.softmax(logits, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        return self.out(out)
+
+
+class XSAEigenBiasAttention(EigenBiasAttention):
+    """Causal Gram bias + XSA exclusion: project out self-write direction from read lines.
+
+    Before computing the Gram-mediated incidence, each read line has its
+    component along the corresponding write line removed. This forces the
+    geometric bias to capture ONLY cross-token relational structure — the
+    self-information is already in the residual stream for the FFN.
+
+    Same param count as eigen_bias. Only the read projection changes.
+    Uses the same causal cumulative Gram as EigenBiasAttention.
+    """
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+
+        # Standard Q·K
+        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+        q, kk, v = qkv[0], qkv[1], qkv[2]
+        std_logits = (q @ kk.transpose(-1, -2)) * self.scale
+
+        Jw, rd = self._compute_lines(x)
+
+        # ── XSA exclusion: project out self-write direction from read lines ──
+        dot = (rd * Jw).sum(dim=-1, keepdim=True)       # (B, H, T, 1)
+        norm_sq = (Jw * Jw).sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        rd_excl = rd - (dot / norm_sq) * Jw              # (B, H, T, 6)
+
+        # ── Causal Gram-mediated incidence (with excluded read lines) ──
+        outer = Jw.unsqueeze(-1) * Jw.unsqueeze(-2)
+        M_causal = outer.cumsum(dim=2)
+
+        rd_M = torch.einsum('bhti,bhtij->bhtj', rd_excl, M_causal)
+        bias_raw = torch.einsum('bhti,bhsi->bhts', rd_M, Jw)
+
+        scale = self.bias_scale.reshape(1, H, 1, 1)
+        bias = bias_raw.abs() * scale
 
         logits = std_logits + bias
         mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
@@ -292,6 +344,7 @@ ATTN_MAP = {
     "standard": StandardAttention,
     "gram_bias": GramBiasAttention,
     "eigen_bias": EigenBiasAttention,
+    "xsa_eigen_bias": XSAEigenBiasAttention,
 }
 
 class Block(nn.Module):
@@ -398,7 +451,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
-    variants = sys.argv[1:] if len(sys.argv) > 1 else ["standard", "gram_bias", "eigen_bias"]
+    variants = sys.argv[1:] if len(sys.argv) > 1 else ["standard", "gram_bias", "eigen_bias", "xsa_eigen_bias"]
     results = {}
 
     for v in variants:

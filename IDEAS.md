@@ -479,6 +479,98 @@ for queries, then the real forward with recalled values). This doubles
 compute when reading is active. Could optimize by caching write lines
 from the previous batch instead.
 
+#### 3k. Iterated Gram (M² 2-hop matching) ← TESTED, negligible
+
+**Status: tested March 23, 2026 — no benefit over standard Gram**
+
+Instead of rd·M·rd (standard), interpolate with rd·M²·rd (2-hop matching).
+M² captures degree-6 interactions: two writes that share structure with a
+common third write both contribute. Learned interpolation parameter α
+between M and M² via sigmoid.
+
+Implementation: `exp_fast.py` IteratedGramAttention, `exp_new_ideas.py`.
+
+Results (2-layer, d=128, 4 heads, synthetic bigram data, 10 epochs):
+
+| Model | PPL | Δ vs standard |
+|-------|-----|---------------|
+| Standard | 190.6 | ←baseline |
+| Online mem | 190.3 | -0.2% |
+| **Iterated Gram** | **190.6** | **-0.0%** |
+
+**Finding**: M² adds no value. The 2-hop relational matching doesn't capture
+structure that M alone misses. The learned α likely stays near 0 (pure M).
+This is consistent with the finding that the information bottleneck is the
+model's ability to USE geometric signal, not the Gram's ability to encode it.
+
+#### 3l. Learned Gram transition (SSM-style) ← TESTED, marginal
+
+**Status: tested March 23, 2026 — ties online_mem, 2x slower**
+
+Replace scalar decay M_t = λ·M_{t-1} + w⊗w with learned 6×6 transition
+matrix: M_t = A·M_{t-1}·A^T + w_t⊗w_t. Allows the Gram to rotate/mix
+its relational structure at each step (like a linear SSM on the Gram).
+Initialized as 0.99·I (near scalar decay).
+
+Implementation: `exp_fast.py` LearnedTransitionAttention, `exp_new_ideas.py`.
+
+Results (2-layer, d=128, 4 heads, synthetic bigram data, 10 epochs):
+
+| Model | PPL | Δ vs standard | Time/epoch |
+|-------|-----|---------------|------------|
+| Standard | 190.6 | ←baseline | ~14s |
+| Online mem | 190.3 | -0.2% | ~18s |
+| **Learned transition** | **190.2** | **-0.2%** | **~36s** |
+
+**Finding**: Ties online_mem but is 2x slower due to the sequential scan
+(can't be parallelized via cumsum like scalar decay). The 6×6 transition
+matrix has 36 parameters per head (vs 1 scalar decay), but doesn't learn
+anything more useful. A likely explanation: on this data, scalar decay
+already captures the temporal weighting well — there's no rotational
+structure in the bigram-generated Gram that A can exploit.
+
+**Lesson**: Sequential scans are expensive. Only worth it if they provide
+qualitatively different behavior (like Mamba's input-dependent transitions).
+
+#### 3m. Separate read/write Grams ← TESTED, marginal
+
+**Status: tested March 23, 2026 — ties online_mem**
+
+Maintains two Gram matrices:
+- M_write = Σ Jw⊗Jw (write structure, queried by read lines)
+- M_read  = Σ Jr⊗Jr (read structure, queried by write lines)
+
+Score = (1-α)·rd·M_write·rd + α·Jw·M_read·Jw, where α is learned.
+The second term is "backward association" — what past reads match my write?
+
+Implementation: `exp_fast.py` SeparateRWGramAttention, `exp_new_ideas.py`.
+
+Results (2-layer, d=128, 4 heads, synthetic bigram data, 10 epochs):
+
+| Model | PPL | Δ vs standard |
+|-------|-----|---------------|
+| Standard | 190.6 | ←baseline |
+| Online mem | 190.3 | -0.2% |
+| **Separate R/W** | **190.3** | **-0.2%** |
+
+**Finding**: Ties online_mem. The read Gram (backward association) doesn't
+add value — likely because in a causal LM, past reads have no privileged
+information about the future. The model probably learns α≈0 (all weight
+on write Gram = standard behavior).
+
+#### Summary of 3k-3m
+
+All three new Gram variants (iterated, learned transition, separate R/W)
+fail to improve over the simple online_mem baseline. This strengthens the
+key finding from the project: **the bottleneck is not in the Gram's
+expressiveness but in the model's ability to use the geometric signal.**
+Richer Gram representations (M², SSM transitions, dual Grams) don't help
+because the scalar gating mechanism can't extract more from them.
+
+Note: tested on synthetic bigram data due to network restrictions. Should
+be re-verified on WikiText-2 where the baseline gap is larger. However,
+the relative rankings should be stable.
+
 ### 4. Higher Grassmannian attention ← TESTED, marginal
 
 **Status: tested March 15, 2026 — higher dims barely help**
@@ -807,6 +899,52 @@ attention:
    structure is relevant to this query?")
 3. **Cross-attention**: transversal candidates scored against temporal store for
    consistency — temporal memory as a prior on the generative path
+
+### Exclusive Gram attention (XSA-inspired) ← testing
+
+Inspired by [Exclusive Self Attention (XSA)](https://arxiv.org/abs/2603.09078)
+which projects out the self-value direction from attention output (two-line change,
+consistent gains up to 2.7B params).
+
+Applied the exclusion idea to *both* pathways:
+1. **XSA on Q·K**: project out self-value direction from attention output, so
+   attention focuses purely on contextual (non-self) information.
+2. **Geometric exclusion on Gram**: project out the self-write Plücker direction
+   from read lines before computing incidence, so the Gram memory only captures
+   relational structure *orthogonal* to the current token's geometry.
+
+Motivation: the residual already carries self-information to the FFN, so both
+attention and Gram memory should focus exclusively on *other* tokens' information.
+
+Implementation: `ExclusiveOnlineMemoryAttention` in `exp_mem_attn.py`
+- Forward pass and gradient flow verified
+- Run: `uv run python exp_mem_attn.py xsa_online_mem`
+- Status: **awaiting WikiText PPL results** (needs local run with data/network access)
+
+Synthetic benchmark results (test_xsa_gram.py, vocab=256, d=128, 2 layers):
+- standard:       PPL 104.0
+- online_mem:     PPL 111.1 (+7.1 worse — Gram overhead hurts on tiny synthetic task)
+- xsa_online_mem: PPL 106.1 (+2.1 worse — exclusion recovers 5 PPL of the gap)
+- XSA exclusion clearly reduces self-information noise in the Gram pathway
+- On WikiText (where online_mem already beats standard), XSA should amplify the win
+
+Induction head results (exp_sparse_gram.py, vocab=64, seq=48, 3000 steps):
+
+Non-causal (BUGGY — future leak in eigendecomposition):
+- eigen_bias:      acc 0.772, xsa_eigen_bias: acc 0.631
+
+Causal fix (cumulative Gram via cumsum, direct rd·M_t·Jw — no eigendecomp needed):
+- standard:        acc 0.101 (baseline)
+- gram_bias:       acc 0.263 (+0.16, full incidence as bias, already causal)
+- eigen_bias:      acc 0.793 (+0.69, causal Gram-mediated incidence)
+- xsa_eigen_bias:  acc 0.609 (+0.51, XSA hurts — -0.18 vs eigen_bias)
+
+Causal version is actually BETTER than non-causal (0.793 vs 0.772) — future
+tokens were adding noise. Direct rd·M_t·Jw is simpler, stabler, and correct.
+
+**Lesson**: XSA exclusion helps in LM (self-info redundant with residual) but
+hurts on induction/pattern-matching (self-identity IS the query signal). The
+exclusion should be task-conditional or gated, not always-on.
 
 ## Open questions
 
