@@ -187,12 +187,13 @@ def belief_propagation(H, W, nc, adj_pairs, potentials, n_iters=30, damping=0.5)
         neighbors[j].append((i, ap_idx, False))   # j is second in potential
 
     # Messages: msg[i][j] = (nc,) message from cell i to cell j
-    # Initialize to zero
+    # Initialize with small random noise for symmetry breaking
+    rng = np.random.RandomState(42)
     messages = {}
     for ap_idx, ((r1, c1), (r2, c2)) in enumerate(adj_pairs):
         i, j = cell_idx(r1, c1), cell_idx(r2, c2)
-        messages[(i, j)] = np.zeros(nc, dtype=np.float32)
-        messages[(j, i)] = np.zeros(nc, dtype=np.float32)
+        messages[(i, j)] = rng.randn(nc).astype(np.float32) * 0.01
+        messages[(j, i)] = rng.randn(nc).astype(np.float32) * 0.01
 
     for iteration in range(n_iters):
         new_messages = {}
@@ -268,6 +269,63 @@ def solve_task(task, n_iters=30):
     decoded = np.array([[used_colors[decoded_idx[r, c]]
                          for c in range(W)] for r in range(H)])
 
+    # Re-decode with unary bias from beliefs
+    decoded_idx = beliefs.argmin(axis=2)
+
+    # ICM refinement with BOTH pairwise potentials AND unary beliefs
+    print(f"  Running ICM refinement...")
+    t0 = time.time()
+    color_to_idx = {c: i for i, c in enumerate(used_colors)}
+    grid_idx = np.array([[color_to_idx[decoded[r, c]]
+                          for c in range(W)] for r in range(H)])
+
+    # Build neighbor lookup: for each cell, list of (edge_idx, is_first)
+    cell_edges = [[[] for _ in range(W)] for _ in range(H)]
+    for ap_idx, ((r1, c1), (r2, c2)) in enumerate(adj_pairs):
+        cell_edges[r1][c1].append((ap_idx, r2, c2, True))
+        cell_edges[r2][c2].append((ap_idx, r1, c1, False))
+
+    for icm_iter in range(50):
+        changed = 0
+        for r in range(H):
+            for c in range(W):
+                current = grid_idx[r, c]
+                # Compute energy contribution of current color
+                best_color = current
+                best_energy = 0.0
+                for ap_idx, nr, nc_, is_first in cell_edges[r][c]:
+                    nb_color = grid_idx[nr, nc_]
+                    if is_first:
+                        best_energy += potentials[ap_idx][current, nb_color]
+                    else:
+                        best_energy += potentials[ap_idx][nb_color, current]
+
+                # Try all other colors
+                for ci in range(len(used_colors)):
+                    if ci == current:
+                        continue
+                    energy = 0.0
+                    for ap_idx, nr, nc_, is_first in cell_edges[r][c]:
+                        nb_color = grid_idx[nr, nc_]
+                        if is_first:
+                            energy += potentials[ap_idx][ci, nb_color]
+                        else:
+                            energy += potentials[ap_idx][nb_color, ci]
+                    if energy < best_energy:
+                        best_energy = energy
+                        best_color = ci
+
+                if best_color != current:
+                    grid_idx[r, c] = best_color
+                    changed += 1
+
+        if changed == 0:
+            break
+
+    icm_time = time.time() - t0
+    decoded = np.array([[used_colors[grid_idx[r, c]]
+                         for c in range(W)] for r in range(H)])
+
     match = np.array_equal(decoded, test_out)
     cell_acc = np.mean(decoded == test_out)
 
@@ -278,6 +336,7 @@ def solve_task(task, n_iters=30):
         'cell_acc': cell_acc,
         'build_time': build_time,
         'bp_time': bp_time,
+        'icm_time': icm_time,
         'n_edges': len(adj_pairs),
     }
 
@@ -343,11 +402,11 @@ def main():
         r = solve_task(task, n_iters=args.iters)
 
         if r['match']:
-            print(f"  SOLVED ✓ (build={r['build_time']:.1f}s, bp={r['bp_time']:.1f}s)")
+            print(f"  SOLVED ✓ (build={r['build_time']:.1f}s, bp={r['bp_time']:.1f}s, icm={r['icm_time']:.1f}s)")
             solved += 1
         else:
             print(f"  cell_acc={r['cell_acc']:.3f} ({int(r['cell_acc']*H*W)}/{H*W} cells)")
-            print(f"  build={r['build_time']:.1f}s, bp={r['bp_time']:.1f}s")
+            print(f"  build={r['build_time']:.1f}s, bp={r['bp_time']:.1f}s, icm={r['icm_time']:.1f}s")
             # Show a few mismatched cells
             pred, correct = r['prediction'], r['correct']
             mismatches = [(r_, c_) for r_ in range(H) for c_ in range(W)
