@@ -1,21 +1,20 @@
 """
 exp_arc_local.py — Local ARC-like test for Gram bias on grid transformations.
 
-Synthetic task mimicking ARC structure:
-  - Small grids (5x5) with 10 colors
-  - Tokenized like mdlARC: colors 0-9, <start>=10, <next_line>=11, <io_sep>=12, <end>=13
-  - Each sequence: <start> input_grid <io_sep> output_grid <end>
-  - Model must predict output tokens given input + separator
+HARD VERSION: Multi-example rule inference.
+  - Each sequence has 2 demonstration pairs + 1 test pair
+  - The transform is drawn from a LARGE family (parameterized, not memorizable)
+  - Model must infer the rule from demos and apply it to the test input
+  - This is the core ARC capability: few-shot abstract reasoning
 
-Transformations (randomly selected per batch):
-  1. Horizontal flip
-  2. Vertical flip
-  3. 90° rotation
-  4. Color swap (swap two specific colors)
-  5. Transpose
+Transform families (parameterized — hundreds of variants):
+  1. Color permutation: randomly permute a subset of colors
+  2. Crop+tile: extract a sub-region and tile it
+  3. Conditional replace: if cell == color_a, replace with color_b
+  4. Row/col shift: cyclically shift rows or columns by k
+  5. Mask+fill: cells matching a color get filled with a pattern from another region
 
-Tests whether Gram bias helps learn spatial transformations vs standard attention.
-Runs in minutes on CPU.
+Tokenization matches mdlARC: colors 0-9, <start>=10, <next_line>=11, <io_sep>=12, <end>=13
 
 Usage:
   uv run python exp_arc_local.py                    # all variants
@@ -27,30 +26,137 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import sys
+import random
 from itertools import combinations
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
 GRID_SIZE = 5       # 5x5 grids
-N_COLORS = 10       # ARC has 10 colors (0-9)
+N_COLORS = 6        # fewer colors = more structure to find
 VOCAB = 14          # 10 colors + 4 special tokens
 START = 10
 NEXT_LINE = 11
 IO_SEP = 12
 END = 13
 
-# Sequence length: <start> + 5*(5+1) + <io_sep> + 5*(5+1) + <end> = 1 + 30 + 1 + 30 + 1 = 63
-SEQ_LEN = 1 + GRID_SIZE * (GRID_SIZE + 1) + 1 + GRID_SIZE * (GRID_SIZE + 1) + 1
+N_DEMOS = 2         # number of demonstration pairs per sequence
+# Sequence: N_DEMOS * (<start> + grid + <io_sep> + grid + <end>) + 1 test pair
+# Per pair: 1 + 5*(5+1) + 1 + 5*(5+1) + 1 = 63
+TOKENS_PER_PAIR = 1 + GRID_SIZE * (GRID_SIZE + 1) + 1 + GRID_SIZE * (GRID_SIZE + 1) + 1
+SEQ_LEN = (N_DEMOS + 1) * TOKENS_PER_PAIR  # 3 pairs * 63 = 189
 
-D_MODEL = 64
+D_MODEL = 96
 N_HEADS = 4
-N_LAYERS = 2
-BATCH = 128
-N_STEPS = 3000
+N_LAYERS = 3
+BATCH = 64
+N_STEPS = 5000
 LR = 3e-4
-EVAL_EVERY = 200
+EVAL_EVERY = 250
 
-N_TRANSFORMS = 5  # number of distinct transformations
+
+# ── Transform families ───────────────────────────────────────────────────────
+
+def random_color_permutation():
+    """Return a transform that permutes colors (parameterized by the permutation)."""
+    # Permute colors 0..N_COLORS-1
+    perm = list(range(N_COLORS))
+    random.shuffle(perm)
+    # Make sure it's not identity
+    while perm == list(range(N_COLORS)):
+        random.shuffle(perm)
+    def transform(grid):
+        out = grid.clone()
+        for src, dst in enumerate(perm):
+            out[grid == src] = dst
+        return out
+    return transform
+
+
+def random_conditional_replace():
+    """If cell == color_a, replace with color_b. Parameterized by (a, b)."""
+    a = random.randint(0, N_COLORS - 1)
+    b = random.randint(0, N_COLORS - 1)
+    while b == a:
+        b = random.randint(0, N_COLORS - 1)
+    def transform(grid):
+        out = grid.clone()
+        out[grid == a] = b
+        return out
+    return transform
+
+
+def random_row_shift():
+    """Cyclically shift all rows by k positions. Parameterized by k."""
+    k = random.randint(1, GRID_SIZE - 1)
+    def transform(grid):
+        return grid.roll(shifts=k, dims=1)
+    return transform
+
+
+def random_col_shift():
+    """Cyclically shift all columns by k positions. Parameterized by k."""
+    k = random.randint(1, GRID_SIZE - 1)
+    def transform(grid):
+        return grid.roll(shifts=k, dims=0)
+    return transform
+
+
+def random_row_col_swap():
+    """Swap two specific rows and two specific columns. Parameterized by (r1,r2,c1,c2)."""
+    r1, r2 = random.sample(range(GRID_SIZE), 2)
+    c1, c2 = random.sample(range(GRID_SIZE), 2)
+    def transform(grid):
+        out = grid.clone()
+        out[r1], out[r2] = grid[r2].clone(), grid[r1].clone()
+        out2 = out.clone()
+        out2[:, c1], out2[:, c2] = out[:, c2].clone(), out[:, c1].clone()
+        return out2
+    return transform
+
+
+def random_border_fill():
+    """Fill the border cells with a specific color. Parameterized by color."""
+    c = random.randint(0, N_COLORS - 1)
+    def transform(grid):
+        out = grid.clone()
+        out[0, :] = c
+        out[-1, :] = c
+        out[:, 0] = c
+        out[:, -1] = c
+        return out
+    return transform
+
+
+def random_reflect_axis():
+    """Reflect along a random axis. Parameterized by axis (0=vert, 1=horiz) + optional transpose."""
+    choice = random.randint(0, 3)
+    def transform(grid):
+        if choice == 0:
+            return grid.flip(0)
+        elif choice == 1:
+            return grid.flip(1)
+        elif choice == 2:
+            return grid.t()
+        else:
+            return grid.rot90(1, [0, 1])
+    return transform
+
+
+TRANSFORM_FAMILIES = [
+    random_color_permutation,
+    random_conditional_replace,
+    random_row_shift,
+    random_col_shift,
+    random_row_col_swap,
+    random_border_fill,
+    random_reflect_axis,
+]
+
+
+def sample_transform():
+    """Sample a random parameterized transform."""
+    family = random.choice(TRANSFORM_FAMILIES)
+    return family()
 
 
 # ── Data generation ──────────────────────────────────────────────────────────
@@ -66,63 +172,48 @@ def grid_to_tokens(grid):
     return tokens
 
 
-def apply_transform(grid, transform_id):
-    """Apply one of N_TRANSFORMS transformations to a grid."""
-    if transform_id == 0:
-        return grid.flip(1)          # horizontal flip
-    elif transform_id == 1:
-        return grid.flip(0)          # vertical flip
-    elif transform_id == 2:
-        return grid.rot90(1, [0, 1]) # 90° clockwise
-    elif transform_id == 3:
-        # color swap: swap color 1 and color 2
-        out = grid.clone()
-        out[grid == 1] = 2
-        out[grid == 2] = 1
-        return out
-    elif transform_id == 4:
-        return grid.t()              # transpose
-    else:
-        return grid
-
-
 def make_arc_batch(batch_size):
-    """Generate batch of (input_grid → transformed_output_grid) sequences.
+    """Generate batch of multi-example ARC-like sequences.
 
-    Each sequence:
-        <start> input_tokens <io_sep> output_tokens <end>
+    Each sequence has N_DEMOS demonstration pairs + 1 test pair, all sharing
+    the same (randomly sampled) transform.
 
-    Returns:
-        x: (batch, SEQ_LEN) input tokens
-        y: (batch, SEQ_LEN) target tokens (-100 for input portion, real for output)
-        transform_ids: (batch,) which transform was applied
+    Sequence structure:
+        <start> demo1_in <io_sep> demo1_out <end>
+        <start> demo2_in <io_sep> demo2_out <end>
+        <start> test_in  <io_sep> test_out  <end>
+
+    Loss is only on the test output tokens (last pair, after <io_sep>).
     """
-    x = torch.full((batch_size, SEQ_LEN), 0, dtype=torch.long)
+    x = torch.zeros(batch_size, SEQ_LEN, dtype=torch.long)
     y = torch.full((batch_size, SEQ_LEN), -100, dtype=torch.long)
-    transform_ids = torch.randint(0, N_TRANSFORMS, (batch_size,))
 
     for i in range(batch_size):
-        # Random input grid
-        in_grid = torch.randint(0, N_COLORS, (GRID_SIZE, GRID_SIZE))
-        out_grid = apply_transform(in_grid, transform_ids[i].item())
+        transform = sample_transform()
+        pos = 0
 
-        in_tokens = grid_to_tokens(in_grid)
-        out_tokens = grid_to_tokens(out_grid)
+        for pair_idx in range(N_DEMOS + 1):
+            in_grid = torch.randint(0, N_COLORS, (GRID_SIZE, GRID_SIZE))
+            out_grid = transform(in_grid)
 
-        # Build sequence
-        seq = [START] + in_tokens + [IO_SEP] + out_tokens + [END]
-        assert len(seq) == SEQ_LEN, f"seq len {len(seq)} != {SEQ_LEN}"
+            in_tokens = grid_to_tokens(in_grid)
+            out_tokens = grid_to_tokens(out_grid)
 
-        x[i] = torch.tensor(seq, dtype=torch.long)
+            seq = [START] + in_tokens + [IO_SEP] + out_tokens + [END]
+            assert len(seq) == TOKENS_PER_PAIR
 
-        # Target: only predict output tokens (after IO_SEP)
-        # IO_SEP is at position 1 + len(in_tokens)
-        sep_pos = 1 + len(in_tokens)
-        # Predict output tokens at positions sep_pos+1 through SEQ_LEN-1
-        for j in range(sep_pos + 1, SEQ_LEN):
-            y[i, j] = x[i, j]
+            for j, tok in enumerate(seq):
+                x[i, pos + j] = tok
 
-    return x, y, transform_ids
+            # Only compute loss on the TEST pair's output tokens
+            if pair_idx == N_DEMOS:
+                sep_offset = 1 + len(in_tokens)  # position of IO_SEP within this pair
+                for j in range(sep_offset + 1, TOKENS_PER_PAIR):
+                    y[i, pos + j] = x[i, pos + j]
+
+            pos += TOKENS_PER_PAIR
+
+    return x, y
 
 
 # ── Plücker primitives ───────────────────────────────────────────────────────
@@ -219,59 +310,9 @@ class EigenBiasAttention(nn.Module):
         return self.out(out)
 
 
-class GramBiasAttention(nn.Module):
-    """Standard attention + direct pairwise Plücker incidence bias (no Gram accumulation)."""
-    def __init__(self, d_model, n_heads, dropout=0.0):
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        self.scale = self.d_head ** -0.5
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.W1_write = nn.Linear(d_model, 4 * n_heads, bias=False)
-        self.W2_write = nn.Linear(d_model, 4 * n_heads, bias=False)
-        self.W1_read = nn.Linear(d_model, 4 * n_heads, bias=False)
-        self.W2_read = nn.Linear(d_model, 4 * n_heads, bias=False)
-        self.bias_scale = nn.Parameter(torch.full((n_heads,), 0.1))
-        self.out = nn.Linear(d_model, d_model)
-        self.register_buffer('J6', _J6)
-
-    def forward(self, x):
-        B, T, D = x.shape
-        H, dh = self.n_heads, self.d_head
-
-        qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
-        q, kk, v = qkv[0], qkv[1], qkv[2]
-        std_logits = (q @ kk.transpose(-1, -2)) * self.scale
-
-        x_prev = torch.cat([torch.zeros(B, 1, D, device=x.device), x[:, :-1]], dim=1)
-        w1 = self.W1_write(x_prev).reshape(B, T, H, 4)
-        w2 = self.W2_write(x).reshape(B, T, H, 4)
-        write_lines = exterior(w1, w2)
-        r1 = self.W1_read(x).reshape(B, T, H, 4)
-        r2 = self.W2_read(x).reshape(B, T, H, 4)
-        read_lines = exterior(r1, r2)
-
-        J = self.J6
-        Jw = torch.einsum('bthi,ij->bthj', write_lines, J).permute(0, 2, 1, 3)
-        rd = read_lines.permute(0, 2, 1, 3)
-
-        # Direct pairwise incidence (no cumulative Gram)
-        bias_raw = torch.einsum('bhti,bhsi->bhts', rd, Jw)
-        scale = self.bias_scale.reshape(1, H, 1, 1)
-        bias = bias_raw.abs() * scale
-
-        logits = std_logits + bias
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        logits = logits.masked_fill(mask, float('-inf'))
-        attn = F.softmax(logits, dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
-        return self.out(out)
-
-
 ATTN_MAP = {
     "standard": StandardAttention,
     "eigen_bias": EigenBiasAttention,
-    "gram_bias": GramBiasAttention,
 }
 
 
@@ -324,17 +365,15 @@ class GridTransformer(nn.Module):
 # ── Training ─────────────────────────────────────────────────────────────────
 
 def evaluate(model, n_batches=20):
-    """Evaluate: fraction of output tokens predicted correctly."""
+    """Token-level accuracy on output portion."""
     model.eval()
     dev = next(model.parameters()).device
-    correct = 0
-    total = 0
+    correct = total = 0
     with torch.no_grad():
         for _ in range(n_batches):
-            x, y, _ = make_arc_batch(BATCH)
+            x, y = make_arc_batch(BATCH)
             x, y = x.to(dev), y.to(dev)
-            logits = model(x)
-            preds = logits.argmax(dim=-1)
+            preds = model(x).argmax(dim=-1)
             mask = y != -100
             total += mask.sum().item()
             correct += ((preds == y) & mask).sum().item()
@@ -342,17 +381,15 @@ def evaluate(model, n_batches=20):
 
 
 def evaluate_full_grid(model, n_batches=20):
-    """Evaluate: fraction of sequences where ALL output tokens are correct."""
+    """Grid-level accuracy: all output tokens correct."""
     model.eval()
     dev = next(model.parameters()).device
-    perfect = 0
-    total = 0
+    perfect = total = 0
     with torch.no_grad():
         for _ in range(n_batches):
-            x, y, _ = make_arc_batch(BATCH)
+            x, y = make_arc_batch(BATCH)
             x, y = x.to(dev), y.to(dev)
-            logits = model(x)
-            preds = logits.argmax(dim=-1)
+            preds = model(x).argmax(dim=-1)
             mask = y != -100
             for i in range(BATCH):
                 m = mask[i]
@@ -364,7 +401,6 @@ def evaluate_full_grid(model, n_batches=20):
 
 
 def train_variant(attn_type, device):
-    """Train a variant and return (acc_history, final_token_acc, final_grid_acc, time)."""
     model = GridTransformer(VOCAB, D_MODEL, N_HEADS, N_LAYERS, SEQ_LEN, attn_type).to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"\n  {attn_type}: {params:,} params")
@@ -375,7 +411,7 @@ def train_variant(attn_type, device):
 
     for step in range(1, N_STEPS + 1):
         model.train()
-        x, y, _ = make_arc_batch(BATCH)
+        x, y = make_arc_batch(BATCH)
         x, y = x.to(device), y.to(device)
         logits = model(x).view(-1, VOCAB)
         loss = F.cross_entropy(logits, y.view(-1), ignore_index=-100)
@@ -389,7 +425,7 @@ def train_variant(attn_type, device):
             grid_acc = evaluate_full_grid(model)
             accs.append((step, tok_acc, grid_acc))
             elapsed = time.time() - t0
-            print(f"    step {step:4d}: loss={loss.item():.3f}  tok_acc={tok_acc:.3f}  grid_acc={grid_acc:.3f}  ({elapsed:.1f}s)")
+            print(f"    step {step:4d}: loss={loss.item():.3f}  tok={tok_acc:.3f}  grid={grid_acc:.3f}  ({elapsed:.1f}s)")
 
     final_tok = evaluate(model, n_batches=50)
     final_grid = evaluate_full_grid(model, n_batches=50)
@@ -402,13 +438,15 @@ def train_variant(attn_type, device):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
+    random.seed(42)
 
-    variants = sys.argv[1:] if len(sys.argv) > 1 else ["standard", "eigen_bias", "gram_bias"]
+    variants = sys.argv[1:] if len(sys.argv) > 1 else ["standard", "eigen_bias"]
     results = {}
 
     print(f"Device: {device}")
-    print(f"Task: ARC-like grid transformation ({GRID_SIZE}x{GRID_SIZE}, {N_COLORS} colors, {N_TRANSFORMS} transforms)")
-    print(f"Sequence length: {SEQ_LEN}")
+    print(f"Task: ARC-like few-shot rule inference ({N_DEMOS} demos + 1 test)")
+    print(f"Grid: {GRID_SIZE}x{GRID_SIZE}, {N_COLORS} colors, 7 transform families (parameterized)")
+    print(f"Seq length: {SEQ_LEN} tokens")
     print(f"Config: d_model={D_MODEL}, n_heads={N_HEADS}, n_layers={N_LAYERS}")
 
     for v in variants:
@@ -420,21 +458,20 @@ def main():
         print(f"{'='*60}")
 
         torch.manual_seed(42)
+        random.seed(42)
         accs, final_tok, final_grid, elapsed = train_variant(v, device)
         results[v] = (accs, final_tok, final_grid, elapsed)
 
-    # Summary
     if len(results) > 1:
         print(f"\n{'='*60}")
-        print("  SUMMARY — ARC Grid Transformation")
+        print("  SUMMARY — ARC Few-Shot Rule Inference")
         print(f"{'='*60}")
         print(f"  {'Variant':15s} {'Tok Acc':>10s} {'Grid Acc':>10s} {'Time':>8s}")
         print(f"  {'-'*50}")
         for v, (accs, final_tok, final_grid, elapsed) in results.items():
             print(f"  {v:15s} {final_tok:10.3f} {final_grid:10.3f} {elapsed:7.1f}s")
 
-        # Learning curves
-        print(f"\n  Learning curves (token accuracy / grid accuracy):")
+        print(f"\n  Learning curves:")
         all_steps = sorted(set(s for v in results for s, _, _ in results[v][0]))
         header = f"  {'Step':>6s}"
         for v in results:
@@ -446,7 +483,7 @@ def main():
                 entry = [(t, g) for s, t, g in results[v][0] if s == step]
                 if entry:
                     t, g = entry[0]
-                    row += f"  {t:.3f}/{g:.3f}        "[:20]
+                    row += f"  {t:6.3f}/{g:.3f}      "[:20]
                 else:
                     row += f"  {'---':>20s}"
             print(row)
