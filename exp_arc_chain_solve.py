@@ -160,14 +160,19 @@ def run_bp(H, W, nc, adj_pairs, potentials, n_iters=30):
     return beliefs
 
 
-def score_grid(grid, test_inp, adj_pairs, potentials, used_colors):
-    """Score a complete grid using precomputed potentials."""
+def score_grid(grid, test_inp, adj_pairs, potentials, used_colors, unary=None):
+    """Score a complete grid using pairwise potentials + unary bias."""
     color_to_idx = {c: i for i, c in enumerate(used_colors)}
+    H, W = grid.shape
     total = 0.0
     for ap_idx, (r, c, r2, c2) in enumerate(adj_pairs):
         ia = color_to_idx[grid[r, c]]
         ib = color_to_idx[grid[r2, c2]]
         total += potentials[ap_idx][ia, ib]
+    if unary is not None:
+        for r in range(H):
+            for c in range(W):
+                total += unary[r, c, color_to_idx[grid[r, c]]]
     return total
 
 
@@ -187,12 +192,52 @@ def solve_task(task):
     adj_pairs, potentials, all_trans = build_potentials_and_transversals(
         task, test_inp, used_colors)
 
-    # Step 2: BP for initial grid
+    # Step 1b: Build unary potentials from training pair statistics
+    # For each cell position, what colors appear in training outputs?
+    # And: what's the relationship between input color and output color?
+    unary = np.zeros((H, W, nc), dtype=np.float32)
+
+    for pair in task['train']:
+        inp, out = np.array(pair['input']), np.array(pair['output'])
+        pH, pW = inp.shape
+        for r in range(min(H, pH)):
+            for c in range(min(W, pW)):
+                in_c = inp[r, c]
+                out_c = out[r, c]
+                # If test input matches this training input color at this position,
+                # bias toward the corresponding output color
+                if test_inp[r, c] == in_c:
+                    out_idx = used_colors.index(out_c) if out_c in used_colors else -1
+                    if out_idx >= 0:
+                        unary[r, c, out_idx] -= 5.0  # strong bias toward this color
+
+                # General: which colors appear at this position in outputs?
+                out_idx = used_colors.index(out_c) if out_c in used_colors else -1
+                if out_idx >= 0:
+                    unary[r, c, out_idx] -= 1.0  # mild bias
+
+    # Penalize identity (output == input) — ARC never has identity
+    for r in range(H):
+        for c in range(W):
+            in_c = test_inp[r, c]
+            if in_c in color_to_idx:
+                # Check if training pairs ever keep this color
+                keeps = sum(1 for p in task['train']
+                           if r < len(p['input']) and c < len(p['input'][0])
+                           and p['input'][r][c] == p['output'][r][c] == in_c)
+                changes = sum(1 for p in task['train']
+                             if r < len(p['input']) and c < len(p['input'][0])
+                             and p['input'][r][c] == in_c and p['output'][r][c] != in_c)
+                if changes > 0 and keeps == 0:
+                    unary[r, c, color_to_idx[in_c]] += 10.0  # penalize keeping input
+
+    # Step 2: BP for initial grid (with unary potentials added to beliefs)
     beliefs = run_bp(H, W, nc, adj_pairs, potentials)
+    beliefs += unary  # add unary bias
     bp_grid_idx = beliefs.argmin(axis=2)
     bp_grid = np.array([[used_colors[bp_grid_idx[r,c]]
                          for c in range(W)] for r in range(H)])
-    bp_score = score_grid(bp_grid, test_inp, adj_pairs, potentials, used_colors)
+    bp_score = score_grid(bp_grid, test_inp, adj_pairs, potentials, used_colors, unary)
     bp_acc = np.mean(bp_grid == test_out)
 
     # Step 3: Find uncertain cells (where top-2 beliefs are close)
@@ -214,7 +259,7 @@ def solve_task(task):
                 continue
             test_grid = best_grid.copy()
             test_grid[r, c] = color
-            s = score_grid(test_grid, test_inp, adj_pairs, potentials, used_colors)
+            s = score_grid(test_grid, test_inp, adj_pairs, potentials, used_colors, unary)
             if s < best_score:
                 best_score = s
                 best_grid = test_grid.copy()
@@ -230,7 +275,7 @@ def solve_task(task):
                         continue
                     test_grid = best_grid.copy()
                     test_grid[r, c] = color
-                    s = score_grid(test_grid, test_inp, adj_pairs, potentials, used_colors)
+                    s = score_grid(test_grid, test_inp, adj_pairs, potentials, used_colors, unary)
                     if s < best_score:
                         best_score = s
                         best_grid = test_grid.copy()
